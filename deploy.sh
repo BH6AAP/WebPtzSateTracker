@@ -22,8 +22,8 @@ fi
 
 # ---------- 本地项目路径 ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKEND_DIR="$SCRIPT_DIR/ptz/backend"
-FRONTEND_DIR="$SCRIPT_DIR/ptz/frontend"
+BACKEND_DIR="$SCRIPT_DIR/backend"
+FRONTEND_DIR="$SCRIPT_DIR/frontend"
 
 # ---------- 颜色输出 ----------
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'

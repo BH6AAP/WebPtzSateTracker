@@ -11,4 +11,5 @@ COPY frontend/ /app/frontend/
 WORKDIR /app/backend
 EXPOSE 8090
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8090"]
+# 后端使用 waitress 启动 (main.py 中 serve(app, host, port))
+CMD ["python", "main.py"]

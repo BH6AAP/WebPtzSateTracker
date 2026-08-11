@@ -32,22 +32,24 @@
 ## 目录结构
 
 ```
-├── ptz/
-│   ├── backend/          # Flask 后端
-│   │   ├── main.py       # 主服务 (Web API + 云台控制 + 编码器接收)
-│   │   ├── auth.py       # 用户认证模块
-│   │   ├── satellite.py  # 卫星跟踪 (TLE/过境/位置计算)
-│   │   ├── pelco.py      # Pelco-D 协议
-│   │   └── requirements.txt
-│   ├── frontend/         # 前端静态文件
-│   │   ├── index.html    # 控制面板 + 登录
-│   │   └── satellite.js  # 地图 + 卫星逻辑
-│   ├── Dockerfile
-│   └── docker-compose.yml
+├── backend/              # Flask 后端
+│   ├── main.py           # 主服务 (Web API + 云台控制 + 编码器接收)
+│   ├── auth.py           # 用户认证模块
+│   ├── satellite.py      # 卫星跟踪 (TLE/过境/位置计算)
+│   ├── pelco.py          # Pelco-D 协议
+│   └── requirements.txt
+├── frontend/             # 前端静态文件
+│   ├── index.html        # 控制面板 + 登录
+│   └── satellite.js      # 地图 + 卫星逻辑
 ├── esp32s3_as5600/       # ESP32-S3 编码器固件 (MicroPython)
 │   ├── main.py           # AS5600 读取 + UDP 广播
 │   └── wifi_manager.py   # WiFi 连接 + AP 配网
 ├── esp_as5600_tcp/       # ESP32 Arduino 版本 (TCP)
+├── docs/                 # 协议文档
+│   ├── D3040.md          # YD3040 云台说明
+│   └── pelcod.md         # Pelco-D 协议
+├── Dockerfile
+├── docker-compose.yml
 └── deploy.sh             # Linux 一键部署脚本
 ```
 
@@ -57,7 +59,7 @@
 
 ```bash
 # 1. 安装依赖
-cd ptz/backend
+cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -98,8 +100,8 @@ PTZ_HOST=192.168.31.67 PTZ_USER=aap PTZ_PASS=你的密码 bash deploy.sh
 
 ## 协议
 
-- [Pelco-D 协议](pelcod.md)
-- [YD3040 云台说明](D3040.md)
+- [Pelco-D 协议](docs/pelcod.md)
+- [YD3040 云台说明](docs/D3040.md)
 
 ## 许可证
 
