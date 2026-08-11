@@ -1,0 +1,14 @@
+services:
+  ptz:
+    build: .
+    container_name: ptz
+    ports:
+      - "8090:8090"
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+    environment:
+      - PTZ_SERIAL_PORT=/dev/ttyUSB0
+      - PTZ_BAUD=9600
+      - PTZ_ADDRESS=1
+      - PTZ_SPEED=0x20
+    restart: unless-stopped

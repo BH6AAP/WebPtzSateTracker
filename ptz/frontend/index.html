@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YD3040 云台 · 卫星跟踪</title>
+<link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0f172a; color: #e2e8f0; overflow: hidden;
+  }
+  /* ===== 登录 ===== */
+  .login-overlay {
+    position: fixed; inset: 0; z-index: 2000;
+    background: rgba(2, 6, 23, .72);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    display: none; align-items: center; justify-content: center;
+  }
+  .login-overlay.show { display: flex; }
+  .login-card {
+    width: 340px; background: rgba(30, 41, 59, .92);
+    border: 1px solid #334155; border-radius: 20px;
+    padding: 38px 32px 28px; box-shadow: 0 24px 70px rgba(0, 0, 0, .5);
+    text-align: center;
+  }
+  .login-logo { font-size: 22px; font-weight: 700; color: #fff; letter-spacing: 1px; }
+  .login-badge {
+    display: inline-block; margin: 14px 0 24px; font-size: 12px; color: #7dd3fc;
+    background: rgba(14, 165, 233, .12); border: 1px solid rgba(14, 165, 233, .35);
+    padding: 4px 14px; border-radius: 999px;
+  }
+  .login-card input {
+    width: 100%; padding: 12px 14px; margin-bottom: 12px;
+    background: #0f172a; border: 1px solid #334155; border-radius: 10px;
+    color: #e2e8f0; font-size: 14px; outline: none;
+  }
+  .login-card input:focus { border-color: #0ea5e9; }
+  .login-card .btn-login {
+    width: 100%; padding: 13px; border: none; border-radius: 10px;
+    background: #0ea5e9; color: #fff; font-size: 15px; font-weight: 600;
+    cursor: pointer; transition: background .2s; margin-top: 4px;
+  }
+  .login-card .btn-login:hover { background: #38bdf8; }
+  .login-msg { min-height: 20px; margin-top: 12px; font-size: 13px; color: #f87171; }
+  .user-bar {
+    position: fixed; top: 12px; right: 14px; z-index: 1500;
+    display: none; align-items: center; gap: 10px;
+    background: rgba(30, 41, 59, .85); border: 1px solid #334155;
+    border-radius: 999px; padding: 6px 8px 6px 16px;
+    font-size: 13px; color: #cbd5e1;
+  }
+  .user-bar .btn-logout {
+    background: #334155; color: #e2e8f0; border: none;
+    border-radius: 999px; padding: 6px 14px; cursor: pointer; font-size: 12px;
+  }
+  .user-bar .btn-logout:hover { background: #475569; }
+  .app { display: flex; height: 100vh; }
+
+  /* ===== 左侧云台控制 (可收起) ===== */
+  .sidebar {
+    width: 320px; min-width: 320px; background: #1e293b; border-right: 1px solid #334155;
+    display: flex; flex-direction: column; transition: margin-left .25s;
+  }
+  .sidebar.collapsed { margin-left: -320px; }
+  .open-btn {
+    position: fixed; left: 0; top: 12px; z-index: 1000;
+    background: #334155; color: #e2e8f0; border: none; border-radius: 0 8px 8px 0;
+    padding: 10px 12px; cursor: pointer; font-size: 16px; display: none;
+  }
+  .sidebar.collapsed ~ .open-btn { display: block; }
+  .sidebar-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 14px; border-bottom: 1px solid #334155;
+  }
+  .sidebar-head h1 { font-size: 16px; }
+  .collapse-btn {
+    background: #334155; color: #e2e8f0; border: none; border-radius: 6px;
+    padding: 6px 10px; cursor: pointer; font-size: 14px;
+  }
+  .sidebar-content { flex: 1; overflow-y: auto; padding: 14px; }
+  .card { background: #0f172a; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .card h2 { font-size: 13px; margin-bottom: 10px; color: #7dd3fc; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; cursor: pointer; }
+  .card-head h2 { margin-bottom: 0; }
+  .card-head .chev { color: #64748b; font-size: 12px; transition: transform .2s; }
+  .card-head.collapsed .chev { transform: rotate(-90deg); }
+  .card-body { overflow: hidden; transition: max-height .25s ease; }
+  .card-body.hidden { max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; }
+  .status { text-align: center; font-size: 12px; color: #94a3b8; padding: 6px 8px 12px; }
+  .encoder-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    background: #0f172a; border-radius: 8px; padding: 8px 10px;
+    margin-top: 10px; font-size: 11px; color: #94a3b8;
+  }
+  .encoder-bar span:first-child { color: #7dd3fc; font-weight: bold; }
+  .encoder-bar #encPan { color: #4ade80; font-weight: bold; }
+
+  /* 方向控制 */
+  .dpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .dpad button {
+    height: 46px; font-size: 18px; border: none; border-radius: 8px;
+    background: #334155; color: #e2e8f0; cursor: pointer; user-select: none;
+  }
+  .dpad button:active { background: #0ea5e9; }
+  .dpad .stop { background: #dc2626; font-size: 13px; }
+  .pos { display: flex; gap: 8px; margin-top: 12px; }
+  .pos-item { text-align: center; background: #1e293b; border-radius: 8px; padding: 8px; flex: 1; }
+  .pos-item .label { font-size: 11px; color: #94a3b8; }
+  .pos-item .value { font-size: 20px; font-weight: bold; color: #7dd3fc; }
+  .pos-item .unit { font-size: 11px; color: #64748b; }
+  .btn-pause {
+    width: 100%; margin-top: 10px; padding: 10px; border: none; border-radius: 8px;
+    cursor: pointer; background: #ef4444; color: #fff; font-size: 14px; font-weight: bold;
+  }
+  .btn-pause.paused { background: #22c55e; }
+
+  .btn-home {
+    width: 100%; padding: 12px; border: none; border-radius: 8px; cursor: pointer;
+    background: #f59e0b; color: #fff; font-size: 14px; font-weight: bold;
+  }
+
+  .set-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .set-row { display: flex; flex-direction: column; gap: 3px; }
+  .set-row label { font-size: 11px; color: #94a3b8; }
+  .set-row input {
+    padding: 7px; border-radius: 6px; border: 1px solid #475569;
+    background: #0f172a; color: #e2e8f0; font-size: 13px; width: 100%;
+  }
+  .btn-save {
+    width: 100%; margin-top: 10px; padding: 10px; border: none; border-radius: 8px;
+    cursor: pointer; background: #16a34a; color: #fff; font-size: 13px; font-weight: bold;
+  }
+
+  .cal-init { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .cal-init label { font-size: 12px; color: #94a3b8; white-space: nowrap; }
+  .cal-init input { flex: 1; padding: 7px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; }
+  .cal-title { font-size: 12px; color: #7dd3fc; margin-bottom: 5px; }
+  .cal-row { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; }
+  .cal-row span { width: 30px; font-size: 11px; color: #94a3b8; }
+  .cal-row input { flex: 1; padding: 6px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 12px; }
+  .cal-row button { padding: 6px 10px; border: none; border-radius: 6px; cursor: pointer; background: #2563eb; color: #fff; font-size: 12px; white-space: nowrap; }
+  .cal-result { margin-top: 8px; font-size: 12px; color: #4ade80; text-align: center; }
+
+  .serial-log {
+    background: #0f172a; border-radius: 8px; padding: 8px; height: 160px;
+    overflow-y: auto; font-family: "SF Mono", Menlo, monospace; font-size: 11px;
+  }
+  .serial-log .empty { color: #64748b; text-align: center; padding-top: 60px; }
+  .serial-log .row { padding: 2px 0; border-bottom: 1px solid #1e293b; }
+  .serial-log .t { color: #64748b; margin-right: 6px; }
+  .serial-log .tx { color: #7dd3fc; }
+  .serial-log .rx { color: #4ade80; }
+  .serial-log .dir { font-weight: bold; margin-right: 6px; }
+  .btn-clear { float: right; padding: 3px 8px; border: none; border-radius: 5px; cursor: pointer; background: #475569; color: #e2e8f0; font-size: 11px; }
+  .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.on { background: #22c55e; } .dot.off { background: #ef4444; }
+
+  /* ===== 中间 (地图 + 收藏列表) ===== */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .map-wrap { flex: 2; position: relative; }
+  #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #0b1220; }
+  .fav-bar { flex: 1; background: #1e293b; border-top: 1px solid #334155; overflow-y: auto; padding: 10px; }
+  .fav-bar h3 { font-size: 13px; color: #7dd3fc; margin-bottom: 8px; }
+  .fav-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 10px; border-radius: 8px; background: #0f172a; margin-bottom: 6px; cursor: pointer;
+  }
+  .fav-item.active { outline: 2px solid #0ea5e9; }
+  .fav-item .name { font-size: 13px; }
+  .fav-item .norad { font-size: 11px; color: #64748b; }
+  .fav-item .pass-info { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+  .fav-item .pass-info .in-pass { color: #4ade80; }
+  .fav-item .pass-info .urgent { color: #facc15; }
+  .fav-item .del { background: #dc2626; color: #fff; border: none; border-radius: 5px; padding: 4px 8px; cursor: pointer; font-size: 11px; flex-shrink: 0; }
+  .fav-add { display: flex; gap: 6px; margin-bottom: 10px; }
+  .fav-add input { flex: 1; padding: 8px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; }
+  .fav-add button { padding: 8px 12px; border: none; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
+
+  /* ===== 右侧 (卫星信息 + 雷达图 + 跟踪) ===== */
+  .right { width: 340px; min-width: 340px; background: #1e293b; border-left: 1px solid #334155; overflow-y: auto; padding: 14px; }
+  .right h3 { font-size: 14px; color: #7dd3fc; margin-bottom: 10px; }
+  .sat-info { background: #0f172a; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  .sat-info .row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+  .sat-info .row .k { color: #94a3b8; }
+  .sat-info .row .v { color: #7dd3fc; font-weight: bold; }
+  .radar-wrap { background: #0f172a; border-radius: 10px; padding: 10px; margin-bottom: 12px; }
+  #radar { width: 100%; aspect-ratio: 1; display: block; }
+  .track-btn {
+    width: 100%; padding: 14px; border: none; border-radius: 10px; cursor: pointer;
+    background: #16a34a; color: #fff; font-size: 15px; font-weight: bold;
+  }
+  .track-btn.tracking { background: #dc2626; }
+  .dur-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .dur-row .dur-label { color: #94a3b8; font-size: 12px; }
+  .dur-btns { display: flex; gap: 6px; }
+  .dur-btn {
+    padding: 4px 10px; border: 1px solid #334155; border-radius: 6px; cursor: pointer;
+    background: #1e293b; color: #cbd5e1; font-size: 12px;
+  }
+  .dur-btn.active { background: #0ea5e9; border-color: #0ea5e9; color: #fff; }
+  .pass-list { margin-top: 12px; }
+  .pass-item { background: #0f172a; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; font-size: 12px; }
+  .pass-item .t { color: #94a3b8; }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #334155; color: #fff; padding: 10px 18px; border-radius: 8px;
+    font-size: 13px; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 9999;
+  }
+  .toast.show { opacity: 1; }
+
+  /* 卫星名称标签 */
+  .sat-label {
+    background: rgba(15,23,42,.85); color: #facc15; font-size: 11px;
+    padding: 1px 5px; border-radius: 3px; white-space: nowrap; text-align: center;
+    border: 1px solid #475569;
+  }
+
+  /* 移动端右侧切换按钮 (桌面隐藏) */
+  .right-btn {
+    position: fixed; right: 0; top: 12px; z-index: 1000;
+    background: #334155; color: #e2e8f0; border: none; border-radius: 8px 0 0 8px;
+    padding: 10px 12px; cursor: pointer; font-size: 14px; display: none;
+  }
+
+  /* ===== 手机端适配 ===== */
+  @media (max-width: 900px) {
+    .sidebar {
+      position: fixed; left: 0; top: 0; bottom: 0; z-index: 1000;
+      box-shadow: 2px 0 12px rgba(0,0,0,.5);
+    }
+    .right {
+      position: fixed; right: 0; top: 0; bottom: 0; z-index: 1000;
+      box-shadow: -2px 0 12px rgba(0,0,0,.5);
+      transform: translateX(100%); transition: transform .25s;
+    }
+    .right.show { transform: translateX(0); }
+    .right-btn { display: block; }
+    .main { width: 100%; }
+    .fav-bar { flex: 0 0 auto; max-height: 28%; }
+  }
+</style>
+</head>
+<body>
+<!-- 登录遮罩 (未登录时显示) -->
+<div class="login-overlay show" id="loginOverlay">
+  <div class="login-card">
+    <div class="login-logo">YD3040 云台</div>
+    <div class="login-badge">卫星自动跟踪 · 远程控制</div>
+    <input id="loginUser" placeholder="用户名" autocomplete="username">
+    <input id="loginPass" type="password" placeholder="密码" autocomplete="current-password">
+    <button class="btn-login" id="btnLogin">登 录</button>
+    <div class="login-msg" id="loginMsg"></div>
+  </div>
+</div>
+<!-- 已登录用户栏 -->
+<div class="user-bar" id="userBar">
+  <span id="userName"></span>
+  <button class="btn-logout" id="btnLogout">退出</button>
+</div>
+<div class="app">
+  <!-- 左侧云台控制 -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <h1>云台控制</h1>
+      <button class="collapse-btn" id="collapseBtn">«</button>
+    </div>
+    <div class="sidebar-content">
+      <div class="status"><span class="dot" id="dot"></span><span id="statusText">检测中...</span></div>
+      <div class="card">
+        <h2>方向控制</h2>
+        <div class="dpad">
+          <button data-dir="upleft">↖</button><button data-dir="up">▲</button><button data-dir="upright">↗</button>
+          <button data-dir="left">◀</button>
+          <button class="stop" data-dir="stop">停止</button>
+          <button data-dir="right">▶</button>
+          <button data-dir="downleft">↙</button><button data-dir="down">▼</button><button data-dir="downright">↘</button>
+        </div>
+        <div class="pos">
+          <div class="pos-item"><div class="label">水平</div><div class="value" id="panVal">0.0<span class="unit">°</span></div></div>
+          <div class="pos-item"><div class="label">垂直</div><div class="value" id="tiltVal">0.0<span class="unit">°</span></div></div>
+        </div>
+        <div class="encoder-bar" id="encoderBar" style="display:none;">
+          <span>AS5600</span>
+          <span id="encRaw">raw:0</span>
+          <span id="encAngle">ang:0°</span>
+          <span id="encPan">pan:0°</span>
+        </div>
+        <button class="btn-pause" id="btnPause">暂停控制</button>
+      </div>
+
+      <div class="card">
+        <h2>复位</h2>
+        <div style="display:flex;gap:8px;">
+          <button class="btn-home" id="btnHome" style="flex:1;">复位（水平回 0° · 俯仰回 0°）</button>
+          <button class="btn-home" id="btnAntiTangle" style="flex:0 0 auto;background:#0369a1;">防缠绕复位</button>
+        </div>
+        <div style="margin-top:8px;font-size:11px;color:#94a3b8;text-align:center;">
+          累计水平偏移: <b id="panAccum" style="color:#7dd3fc;">0°</b>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head" id="encCalToggle">
+          <h2>AS5600 标定</h2>
+          <span class="chev" id="encCalChev">▾</span>
+        </div>
+        <div class="card-body" id="encCalBody">
+          <div class="encoder-live" style="display:flex;justify-content:space-between;font-size:11px;color:#94a3b8;margin-bottom:10px;">
+            <span>raw:<b id="encCalRaw">-</b></span>
+            <span>ang:<b id="encCalAngle">-</b>°</span>
+            <span>pan:<b id="encCalPan">-</b>°</span>
+          </div>
+          <div class="cal-init"><label>云台真实水平角°</label><input type="number" step="0.1" id="encCalReal" placeholder="如 0"></div>
+          <button class="btn-save" id="btnEncCalAdd" style="margin-bottom:8px;">记录当前点</button>
+          <div class="cal-title">已记录标定点 (<span id="encCalCount">0</span>)</div>
+          <div id="encCalPoints" style="font-size:12px;color:#94a3b8;margin-bottom:10px;">
+            <div style="text-align:center;padding:8px 0;">暂无</div>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn-save" id="btnEncCalClear" style="flex:1;background:#475569;">清除</button>
+            <button class="btn-save" id="btnEncCalSave" style="flex:1;">保存标定</button>
+          </div>
+          <div class="cal-result" id="encCalResult"></div>
+          <div style="font-size:11px;color:#64748b;margin-top:8px;">提示：记录 2 个不同真实角度即可自动计算传动比；1 点仅做偏移。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head" id="calToggle">
+          <h2>速度校准</h2>
+          <span class="chev" id="calChev">▾</span>
+        </div>
+        <div class="card-body" id="calBody">
+          <div class="cal-init"><label>水平初始方位角°</label><input type="number" step="0.1" id="calInitPan" placeholder="初始方位角"></div>
+          <div class="cal-init"><label>俯仰初始俯仰角°</label><input type="number" step="0.1" id="calInitTilt" placeholder="初始俯仰角"></div>
+          <div class="cal-title">水平轴</div>
+          <div class="cal-row"><span>左转</span><input type="number" step="0.5" id="calP1t" value="30"><button data-dir="left" data-idx="1">开始</button><input type="number" step="0.1" id="calP1a" placeholder="角度"></div>
+          <div class="cal-row"><span>右转</span><input type="number" step="0.5" id="calP2t" value="20"><button data-dir="right" data-idx="2">开始</button><input type="number" step="0.1" id="calP2a" placeholder="角度"></div>
+          <div class="cal-row"><span>左转</span><input type="number" step="0.5" id="calP3t" value="10"><button data-dir="left" data-idx="3">开始</button><input type="number" step="0.1" id="calP3a" placeholder="角度"></div>
+          <button class="btn-save" id="btnCalPan">计算并保存水平速度</button>
+          <div class="cal-result" id="calResultPan"></div>
+          <div class="cal-title" style="margin-top:10px">俯仰轴 <span style="color:#94a3b8;font-weight:normal">(第1/3组上转算抬头速度, 第2组下转算低头速度)</span></div>
+          <div class="cal-row"><span>上转</span><input type="number" step="0.5" id="calT1t" value="30"><button data-dir="up" data-idx="1" data-axis="T">开始</button><input type="number" step="0.1" id="calT1a" placeholder="角度"></div>
+          <div class="cal-row"><span>下转</span><input type="number" step="0.5" id="calT2t" value="20"><button data-dir="down" data-idx="2" data-axis="T">开始</button><input type="number" step="0.1" id="calT2a" placeholder="角度"></div>
+          <div class="cal-row"><span>上转</span><input type="number" step="0.5" id="calT3t" value="10"><button data-dir="up" data-idx="3" data-axis="T">开始</button><input type="number" step="0.1" id="calT3a" placeholder="角度"></div>
+          <button class="btn-save" id="btnCalTilt">计算并保存俯仰速度</button>
+          <div class="cal-result" id="calResultTilt"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>指定位置</h2>
+        <div class="set-grid">
+          <div class="set-row"><label>目标水平角°</label><input type="number" step="0.1" id="gotoPan" placeholder="留空不变"></div>
+          <div class="set-row"><label>目标俯仰角°</label><input type="number" step="0.1" id="gotoTilt" placeholder="留空不变"></div>
+        </div>
+        <button class="btn-save" id="btnGoto">转到目标位置</button>
+      </div>
+
+      <div class="card">
+        <h2>设置</h2>
+        <div class="set-grid">
+          <div class="set-row"><label>水平速度 °/s</label><input type="number" step="0.01" id="setPanSpeed"></div>
+          <div class="set-row"><label>俯仰速度 °/s</label><input type="number" step="0.01" id="setTiltSpeed"></div>
+          <div class="set-row"><label>俯仰抬头速度 °/s</label><input type="number" step="0.01" id="setTiltUpSpeed"></div>
+          <div class="set-row"><label>俯仰低头速度 °/s</label><input type="number" step="0.01" id="setTiltDownSpeed"></div>
+          <div class="set-row"><label>水平最小°</label><input type="number" step="0.1" id="setPanMin"></div>
+          <div class="set-row"><label>水平最大°</label><input type="number" step="0.1" id="setPanMax"></div>
+          <div class="set-row"><label>俯仰最小°</label><input type="number" step="0.1" id="setTiltMin"></div>
+          <div class="set-row"><label>俯仰最大°</label><input type="number" step="0.1" id="setTiltMax"></div>
+          <div class="set-row"><label>复位俯仰秒</label><input type="number" step="0.5" id="setResetTilt"></div>
+          <div class="set-row"><label>观测站纬度</label><input type="number" step="0.0001" id="setObsLat" placeholder="如 39.9"></div>
+          <div class="set-row"><label>观测站经度</label><input type="number" step="0.0001" id="setObsLon" placeholder="如 116.4"></div>
+          <div class="set-row"><label>观测站网格</label><input type="text" id="setObsGrid" placeholder="如 OM89"></div>
+        </div>
+        <button class="btn-save" id="btnSave">保存设置</button>
+      </div>
+
+      <div class="card">
+        <h2>串口监控 <button class="btn-clear" id="btnClear">清空</button></h2>
+        <div class="serial-log" id="serialLog"><div class="empty">暂无数据</div></div>
+      </div>
+    </div>
+  </aside>
+
+  <button id="openBtn" class="open-btn">»</button>
+  <button id="rightBtn" class="right-btn">卫星</button>
+
+  <!-- 中间: 地图 + 收藏列表 -->
+  <main class="main">
+    <div class="map-wrap"><div id="map"></div></div>
+    <div class="fav-bar">
+      <h3>已收藏卫星</h3>
+      <div class="fav-add">
+        <input id="favSearch" placeholder="输入卫星名称或 NORAD 编号搜索">
+        <button id="btnFavAdd">添加</button>
+      </div>
+      <div id="favList"></div>
+    </div>
+  </main>
+
+  <!-- 右侧: 卫星信息 + 雷达图 + 跟踪 -->
+  <aside class="right">
+    <h3>卫星信息</h3>
+    <div class="sat-info" id="satInfo">
+      <div class="row"><span class="k">未选择卫星</span></div>
+    </div>
+    <div class="dur-row">
+      <span class="dur-label">轨迹时长</span>
+      <div class="dur-btns" id="durBtns">
+        <button class="dur-btn" data-hours="1">1h</button>
+        <button class="dur-btn" data-hours="3">3h</button>
+        <button class="dur-btn" data-hours="6">6h</button>
+        <button class="dur-btn active" data-hours="12">12h</button>
+      </div>
+    </div>
+    <h3>过境雷达图</h3>
+    <div class="radar-wrap"><canvas id="radar" width="300" height="300"></canvas></div>
+    <button class="track-btn" id="btnTrack">开始跟踪</button>
+    <div class="pass-list" id="passList"></div>
+  </aside>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+
+async function api(url, body) {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '请求失败');
+    return data;
+  } catch (e) {
+    toast('错误: ' + e.message);
+    throw e;
+  }
+}
+
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// ===== 侧栏收起/展开 =====
+$('collapseBtn').onclick = () => {
+  $('sidebar').classList.add('collapsed');
+  setTimeout(() => window.map && window.map.invalidateSize(), 300);
+};
+$('openBtn').onclick = () => {
+  $('sidebar').classList.remove('collapsed');
+  setTimeout(() => window.map && window.map.invalidateSize(), 300);
+};
+$('rightBtn').onclick = () => {
+  const r = document.querySelector('.right');
+  r.classList.toggle('show');
+  $('rightBtn').textContent = r.classList.contains('show') ? '×' : '卫星';
+};
+
+// ===== 方向控制 =====
+document.querySelectorAll('.dpad button').forEach(btn => {
+  const dir = btn.dataset.dir;
+  if (dir === 'stop') {
+    btn.addEventListener('click', () => api('/api/move/stop', {}));
+    return;
+  }
+  btn.addEventListener('mousedown', async () => {
+    try {
+      const res = await fetch('/api/move/' + dir, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (data.blocked) toast(data.detail || '已达限位');
+    } catch (e) { /* 忽略 */ }
+  });
+  const stop = () => api('/api/move/stop', {});
+  btn.addEventListener('mouseup', stop);
+  btn.addEventListener('mouseleave', stop);
+  btn.addEventListener('touchstart', (e) => { e.preventDefault(); api('/api/move/' + dir, {}); }, { passive: false });
+  btn.addEventListener('touchend', stop);
+});
+
+// ===== 复位 =====
+function setAllButtonsDisabled(disabled) {
+  document.querySelectorAll('button').forEach(b => { b.disabled = disabled; });
+}
+$('btnHome').onclick = async () => {
+  if (confirm('确定复位到 0° 限位位置？')) {
+    setAllButtonsDisabled(true);
+    try {
+      const data = await api('/api/reset', {});
+      const total = data.duration || 20;
+      toast('复位中，请稍候...');
+      setTimeout(() => { setAllButtonsDisabled(false); toast('复位成功'); }, total * 1000 + 500);
+    } catch (e) { setAllButtonsDisabled(false); }
+  }
+};
+
+// ===== 防缠绕复位 =====
+$('btnAntiTangle').onclick = async () => {
+  try {
+    const res = await fetch('/api/position');
+    const data = await res.json();
+    const accum = data.pan_accum || 0;
+    if (Math.abs(accum) < 1) { toast('累计偏移不足 1°，无需防缠绕复位'); return; }
+    if (!confirm('当前累计水平偏移 ' + accum + '°，将反向回退至零点，确定？')) return;
+    setAllButtonsDisabled(true);
+    const resp = await api('/api/anti_tangle_reset', {});
+    const total = resp.duration || 10;
+    toast('防缠绕复位中... 反向回退 ' + resp.accum + '°');
+    setTimeout(() => { setAllButtonsDisabled(false); toast('防缠绕复位完成'); }, total * 1000 + 500);
+  } catch (e) { setAllButtonsDisabled(false); toast('防缠绕复位失败'); }
+};
+
+// ===== 串口监控 =====
+let lastLogLen = 0;
+async function pollSerialLog() {
+  try {
+    const res = await fetch('/api/seriallog');
+    const data = await res.json();
+    if (!data.ok) return;
+    const log = data.log;
+    if (log.length === lastLogLen) return;
+    lastLogLen = log.length;
+    const box = $('serialLog');
+    if (log.length === 0) { box.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+    box.innerHTML = log.map(e =>
+      `<div class="row"><span class="t">${e.time}</span>` +
+      `<span class="dir ${e.dir === 'TX' ? 'tx' : 'rx'}">${e.dir}</span>` +
+      `<span class="${e.dir === 'TX' ? 'tx' : 'rx'}">${e.hex}</span></div>`).join('');
+    box.scrollTop = box.scrollHeight;
+  } catch (e) { /* 忽略 */ }
+}
+$('btnClear').onclick = () => { lastLogLen = 0; $('serialLog').innerHTML = '<div class="empty">暂无数据</div>'; };
+
+// ===== 设置 =====
+const setMap = {
+  setPanSpeed: 'pan_speed_dps', setTiltSpeed: 'tilt_speed_dps',
+  setTiltUpSpeed: 'tilt_up_speed_dps', setTiltDownSpeed: 'tilt_down_speed_dps',
+  setPanMin: 'pan_min', setPanMax: 'pan_max',
+  setTiltMin: 'tilt_min', setTiltMax: 'tilt_max',
+  setResetTilt: 'reset_tilt_s'
+};
+async function loadSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    if (!data.ok) return;
+    for (const [id, key] of Object.entries(setMap)) {
+      if (data[key] === undefined) continue;
+      if ($(id).type === 'checkbox') $(id).checked = !!data[key];
+      else $(id).value = data[key];
+    }
+  } catch (e) { /* 忽略 */ }
+  // 加载观测站
+  try {
+    const r = await fetch('/api/sat/observer');
+    const d = await r.json();
+    if (d.ok) { $('setObsLat').value = d.lat; $('setObsLon').value = d.lon; }
+  } catch (e) { /* 忽略 */ }
+}
+$('btnSave').onclick = async () => {
+  const body = {};
+  for (const [id, key] of Object.entries(setMap)) {
+    if ($(id).type === 'checkbox') body[key] = $(id).checked;
+    else { const v = parseFloat($(id).value); if (!isNaN(v)) body[key] = v; }
+  }
+  // 保存观测站 (支持网格或经纬度)
+  const grid = $('setObsGrid').value.trim();
+  const lat = parseFloat($('setObsLat').value);
+  const lon = parseFloat($('setObsLon').value);
+  let obsBody = null;
+  if (grid) obsBody = { grid };
+  else if (!isNaN(lat) && !isNaN(lon)) obsBody = { lat, lon };
+  if (obsBody) {
+    try {
+      await fetch('/api/sat/observer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obsBody) });
+      if (window.updateObserverOnMap) window.updateObserverOnMap();
+    } catch (e) { /* 忽略 */ }
+  }
+  try {
+    const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (data.ok) toast('设置已保存'); else toast('保存失败: ' + (data.detail || ''));
+  } catch (e) { toast('保存失败: ' + e.message); }
+};
+
+// ===== 速度校准 (可折叠) =====
+$('calToggle').onclick = () => {
+  const body = $('calBody');
+  const head = $('calToggle');
+  body.classList.toggle('hidden');
+  head.classList.toggle('collapsed');
+};
+document.querySelectorAll('.cal-row button').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const dir = btn.dataset.dir;
+    const idx = btn.dataset.idx;
+    const axis = btn.dataset.axis || 'P';  // 俯仰行按钮带 data-axis="T", 水平行默认 P
+    const duration = parseFloat($('cal' + axis + idx + 't').value);
+    if (isNaN(duration) || duration <= 0) { toast('请输入有效时长'); return; }
+    btn.disabled = true; btn.textContent = '转动中...';
+    try {
+      const res = await fetch('/api/calibrate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ direction: dir, duration }) });
+      const data = await res.json();
+      if (!data.ok) toast('失败: ' + (data.detail || '')); else toast('转动中，请观察手机指南针');
+    } catch (e) { toast('失败: ' + e.message); }
+    setTimeout(() => { btn.disabled = false; btn.textContent = '开始'; }, duration * 1000 + 500);
+  });
+});
+
+$('btnCalPan').onclick = async () => {
+  const pan0 = parseFloat($('calInitPan').value);
+  if (isNaN(pan0)) { toast('请先填写水平初始方位角'); return; }
+  const panSpeeds = []; let prev = pan0;
+  for (let i = 1; i <= 3; i++) {
+    const t = parseFloat($('calP' + i + 't').value);
+    const a = parseFloat($('calP' + i + 'a').value);
+    if (isNaN(t) || isNaN(a) || t <= 0) { toast('水平第' + i + '组数据不完整'); return; }
+    panSpeeds.push(Math.abs(a - prev) / t); prev = a;
+  }
+  const panSpeed = panSpeeds.reduce((s, v) => s + v, 0) / 3;
+  try {
+    const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pan_speed_dps: panSpeed }) });
+    const data = await res.json();
+    if (data.ok) { $('calResultPan').textContent = `水平 ${panSpeed.toFixed(3)}°/s，已保存`; $('setPanSpeed').value = panSpeed.toFixed(3); toast('水平速度已保存'); }
+    else toast('保存失败');
+  } catch (e) { toast('保存失败: ' + e.message); }
+};
+
+$('btnCalTilt').onclick = async () => {
+  const tilt0 = parseFloat($('calInitTilt').value);
+  if (isNaN(tilt0)) { toast('请先填写俯仰初始俯仰角'); return; }
+  // 第1组: 上转; 第2组: 下转; 第3组: 上转 (角度按上一组终点连续推算)
+  const rowSpecs = [{ i: 1, dir: 'up' }, { i: 2, dir: 'down' }, { i: 3, dir: 'up' }];
+  const upSpeeds = [], downSpeeds = [];
+  let prev = tilt0;
+  for (const r of rowSpecs) {
+    const t = parseFloat($('calT' + r.i + 't').value);
+    const a = parseFloat($('calT' + r.i + 'a').value);
+    if (isNaN(t) || isNaN(a) || t <= 0) { toast('俯仰第' + r.i + '组数据不完整'); return; }
+    const sp = Math.abs(a - prev) / t;
+    (r.dir === 'up' ? upSpeeds : downSpeeds).push(sp);
+    prev = a;
+  }
+  const upSpeed = upSpeeds.reduce((s, v) => s + v, 0) / upSpeeds.length;
+  const downSpeed = downSpeeds[0];
+  const avg = (upSpeed + downSpeed) / 2;
+  try {
+    const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tilt_speed_dps: avg, tilt_up_speed_dps: upSpeed, tilt_down_speed_dps: downSpeed }) });
+    const data = await res.json();
+    if (data.ok) {
+      $('calResultTilt').textContent = `抬头 ${upSpeed.toFixed(3)} 低头 ${downSpeed.toFixed(3)} °/s，已保存`;
+      $('setTiltSpeed').value = avg.toFixed(3);
+      $('setTiltUpSpeed').value = upSpeed.toFixed(3);
+      $('setTiltDownSpeed').value = downSpeed.toFixed(3);
+      toast('俯仰速度已保存');
+    }
+    else toast('保存失败');
+  } catch (e) { toast('保存失败: ' + e.message); }
+};
+
+// ===== 指定位置 =====
+$('btnGoto').onclick = async () => {
+  const pan = $('gotoPan').value.trim();
+  const tilt = $('gotoTilt').value.trim();
+  const body = {};
+  if (pan) body.pan = parseFloat(pan);
+  if (tilt) body.tilt = parseFloat(tilt);
+  if (!Object.keys(body).length) { toast('请至少输入一个目标角度'); return; }
+  try {
+    const res = await fetch('/api/move/to', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (data.ok) toast('已开始转向目标位置');
+    else toast('失败: ' + (data.detail || ''));
+  } catch (e) { toast('失败: ' + e.message); }
+};
+
+// ===== 暂停控制 =====
+function updatePauseBtn(paused) {
+  const btn = $('btnPause');
+  if (paused) { btn.classList.add('paused'); btn.textContent = '恢复控制'; }
+  else { btn.classList.remove('paused'); btn.textContent = '暂停控制'; }
+}
+$('btnPause').onclick = async () => {
+  const paused = !$('btnPause').classList.contains('paused');
+  try {
+    const res = await fetch('/api/pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paused }) });
+    const data = await res.json();
+    if (data.ok) updatePauseBtn(data.paused);
+  } catch (e) { /* 忽略 */ }
+};
+
+// ===== 状态检测 =====
+async function checkStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    if (data.ok) {
+      $('dot').className = 'dot on';
+      $('statusText').textContent = `已连接 ${data.port} @ ${data.baud}`;
+      updatePauseBtn(data.paused);
+    } else {
+      $('dot').className = 'dot off';
+      $('statusText').textContent = '串口未连接: ' + (data.detail || '');
+    }
+  } catch (e) {
+    $('dot').className = 'dot off';
+    $('statusText').textContent = '无法连接后端';
+  }
+}
+
+// ===== 位置轮询 =====
+async function pollPosition() {
+  try {
+    const res = await fetch('/api/position');
+    const data = await res.json();
+    if (data.ok) {
+      $('panVal').innerHTML = data.pan + '<span class="unit">°</span>';
+      $('tiltVal').innerHTML = data.tilt + '<span class="unit">°</span>';
+      const pa = $('panAccum');
+      if (pa) pa.textContent = (data.pan_accum || 0) + '°';
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+// ===== AS5600 编码器数值显示 =====
+async function pollEncoder() {
+  try {
+    const res = await fetch('/api/encoder');
+    const data = await res.json();
+    if (data.ok && data.angle !== null) {
+      $('encoderBar').style.display = 'flex';
+      $('encRaw').textContent = 'raw:' + (data.raw ?? '-');
+      $('encAngle').textContent = 'ang:' + Number(data.angle).toFixed(1) + '°';
+      $('encPan').textContent = 'pan:' + Number(data.pan).toFixed(1) + '°';
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+checkStatus();
+loadSettings();
+setInterval(checkStatus, 5000);
+setInterval(pollPosition, 500);
+setInterval(pollEncoder, 500);
+setInterval(pollSerialLog, 800);
+</script>
+<script src="satellite.js?v=10"></script>
+<script>
+// ===== 用户登录状态 =====
+(function () {
+  const g = id => document.getElementById(id);
+  const overlay = g('loginOverlay');
+  const userBar = g('userBar');
+  const msg = g('loginMsg');
+
+  function showApp(user) {
+    overlay.classList.remove('show');
+    userBar.style.display = 'flex';
+    g('userName').textContent = user.username + (user.role === 'admin' ? ' · 管理员' : '');
+  }
+  function showLogin() {
+    overlay.classList.add('show');
+    userBar.style.display = 'none';
+  }
+
+  async function checkAuth() {
+    try {
+      const r = await fetch('/api/auth/me');
+      const d = await r.json();
+      if (d.ok) showApp(d.user);
+      else showLogin();
+    } catch (e) { showLogin(); }
+  }
+
+  g('btnLogin').addEventListener('click', async () => {
+    const username = g('loginUser').value.trim();
+    const password = g('loginPass').value;
+    if (!username || !password) { msg.textContent = '请输入用户名和密码'; return; }
+    msg.textContent = '';
+    try {
+      const r = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      const d = await r.json();
+      if (d.ok) {
+        showApp(d.user);
+        setTimeout(() => location.reload(), 250); // 刷新让卫星模块以登录态初始化
+      } else {
+        msg.textContent = d.error || '登录失败';
+      }
+    } catch (e) { msg.textContent = '网络错误，请重试'; }
+  });
+
+  g('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') g('btnLogin').click(); });
+  g('btnLogout').addEventListener('click', async () => {
+    try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (e) {}
+    location.reload();
+  });
+
+  checkAuth();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ===== 运行时数据 (含敏感信息, 不提交) =====
+ptz/config.json
+ptz/users.json
+ptz/encoder_cal.json
+ptz/sat_favorites.json
+ptz/sat_observer.json
+ptz/tle_cache.json
+ptz/backend/*.json
+
+# ===== ESP32 运行时状态 =====
+esp32s3_as5600/as5600_state.txt
+esp_as5600_tcp/*.txt
+
+# ===== 部署凭据 (含服务器密码, 不提交) =====
+j1900主机说明.md
+deploy.local.sh
+
+# ===== 系统/编辑器 =====
+.DS_Store
+*.log
+.idea/
+.vscode/
