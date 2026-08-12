@@ -1460,12 +1460,31 @@ def _auto_calib_worker():
             if c0 is not None and cont is not None and abs(cont - c0) >= 16384:
                 break
             stop_ev.wait(0.1)
+        # 多次发 stop, 确保云台真正停止 (防止被残留指令覆盖)
+        for _ in range(3):
+            try:
+                send(pelco.stop())
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.15)
+    except Exception:  # noqa: BLE001
         try:
             send(pelco.stop())
         except Exception:  # noqa: BLE001
             pass
-    except Exception:  # noqa: BLE001
-        pass
+    # 等待云台停稳 (连续 3 帧增量 < 3 raw, 最多 5s) 再提示用户
+    last = _read_cont_raw()
+    settled = 0
+    for _ in range(50):
+        time.sleep(0.1)
+        cur = _read_cont_raw()
+        if last is not None and cur is not None and abs(cur - last) < 3:
+            settled += 1
+            if settled >= 3:
+                break
+        else:
+            settled = 0
+        last = cur
     with _auto_calib_lock:
         _auto_calib["samples"] = samples
         _auto_calib["running"] = False
@@ -1488,6 +1507,8 @@ def encoder_autocalib():
     data = request.get_json(silent=True) or {}
     action = data.get("action")
     if action == "start":
+        if is_paused():
+            return err("云台处于暂停状态, 请先恢复")
         with _auto_calib_lock:
             if _auto_calib["running"] or _auto_calib["phase"] == "turning":
                 return err("自动标定正在进行中")
@@ -1501,6 +1522,15 @@ def encoder_autocalib():
             _auto_calib["samples"] = []
             _auto_calib["phase"] = "turning"
             _auto_calib["running"] = True
+        # 停止其他运动源, 防止并发驱动云台 (覆盖 stop)
+        try:
+            stop_hold()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            sat_tracker.stop()
+        except Exception:  # noqa: BLE001
+            pass
         threading.Thread(target=_auto_calib_worker, daemon=True).start()
         return ok({"msg": "开始自动标定: 云台右转约一圈, 完成后请把云台调回物理 0° 再点确认"})
 
