@@ -1410,6 +1410,144 @@ def encoder_calibrate():
                "pan": _pan_from_cont_raw(_cur_cont_raw())})
 
 
+# ---------- 自动转一圈标定 (起终点物理 0° 锚定, 消除人工对准误差) ----------
+_auto_calib_lock = threading.Lock()
+_auto_calib = {
+    "running": False,   # 后台转动线程是否在跑
+    "phase": "idle",    # idle / turning / awaiting_confirm / done
+    "t0": 0.0,          # 转动开始时刻
+    "c0": None,         # 起点 cont_raw (设 0 点后)
+    "samples": [],      # [(elapsed, cont_raw)] 转动采样
+    "stop_cmd": None,   # 后台线程停止 Event
+}
+
+
+def _read_cont_raw():
+    with _encoder_lock:
+        return _encoder_state.get("cont_raw")
+
+
+def _auto_calib_worker():
+    """后台: 开环右转约一圈, 期间采样 (elapsed, cont_raw), 到时停止
+    转动圈数以起终点物理 0° 为绝对锚点, 中途采样仅用于速度校准"""
+    global _auto_calib
+    with _auto_calib_lock:
+        t0 = _auto_calib["t0"]
+        c0 = _auto_calib["c0"]
+        stop_ev = _auto_calib["stop_cmd"] = threading.Event()
+        _auto_calib["phase"] = "turning"
+    dur = 360.0 / get_cfg("pan_speed_dps") + 12.0  # 一圈时长 + 12s 兜底超时
+    samples = []
+    try:
+        while not stop_ev.is_set():
+            elapsed = time.time() - t0
+            if elapsed >= dur:
+                break
+            try:
+                send(pelco.right())
+            except Exception:  # noqa: BLE001
+                break
+            cont = _read_cont_raw()
+            samples.append((elapsed, cont))
+            # AS5600 增量 ≥16384 raw (=AS5600 4圈≈云台一圈) 即停, 用户微调量最小
+            if c0 is not None and cont is not None and abs(cont - c0) >= 16384:
+                break
+            stop_ev.wait(0.1)
+        try:
+            send(pelco.stop())
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    with _auto_calib_lock:
+        _auto_calib["samples"] = samples
+        _auto_calib["running"] = False
+        _auto_calib["phase"] = "awaiting_confirm"
+
+
+@app.route("/api/encoder/autocalib", methods=["GET", "POST"])
+def encoder_autocalib():
+    """自动转一圈标定: start(开环右转一圈) -> 用户调回物理 0° -> confirm(计算 rpd + 校准速度)"""
+    global _last_pan_cont
+    if request.method == "GET":
+        with _auto_calib_lock:
+            ac = dict(_auto_calib)
+        elapsed = 0.0
+        if ac["t0"]:
+            elapsed = round(time.time() - ac["t0"], 1)
+        return ok({"status": ac["phase"], "running": ac["running"],
+                   "elapsed": elapsed, "c0": ac["c0"]})
+
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    if action == "start":
+        with _auto_calib_lock:
+            if _auto_calib["running"] or _auto_calib["phase"] == "turning":
+                return err("自动标定正在进行中")
+            if _cal_origin is None:
+                return err("请先设 0 点 (set_origin)")
+            c0 = _read_cont_raw()
+            if c0 is None:
+                return err("尚未收到 AS5600 raw 数据")
+            _auto_calib["t0"] = time.time()
+            _auto_calib["c0"] = c0
+            _auto_calib["samples"] = []
+            _auto_calib["phase"] = "turning"
+            _auto_calib["running"] = True
+        threading.Thread(target=_auto_calib_worker, daemon=True).start()
+        return ok({"msg": "开始自动标定: 云台右转约一圈, 完成后请把云台调回物理 0° 再点确认"})
+
+    if action == "confirm":
+        with _auto_calib_lock:
+            if _auto_calib["phase"] != "awaiting_confirm":
+                return err("当前无待确认的自动标定 (请先 start)")
+            c0 = _auto_calib["c0"]
+            samples = list(_auto_calib["samples"])
+        if c0 is None:
+            return err("缺少起点数据")
+        c1 = _read_cont_raw()
+        if c1 is None:
+            return err("尚未收到 AS5600 raw 数据")
+        delta = c1 - c0
+        if abs(delta) < 12000 or abs(delta) > 20000:
+            return err(f"转过的 raw 量异常 ({delta}), 请确认云台已回到物理 0° 附近 (一圈约 ±16384)")
+        rpd = delta / 360.0
+        # 速度校准: 从采样找 |cont-c0| 首次达到 |delta| 的时刻 (线性插值)
+        T_cross = None
+        target = abs(delta)
+        for i in range(1, len(samples)):
+            d_prev = abs(samples[i - 1][1] - c0) if samples[i - 1][1] is not None else 0.0
+            d_cur = abs(samples[i][1] - c0) if samples[i][1] is not None else 0.0
+            if d_cur >= target:
+                if d_cur != d_prev:
+                    frac = (target - d_prev) / (d_cur - d_prev)
+                    T_cross = samples[i - 1][0] + frac * (samples[i][0] - samples[i - 1][0])
+                else:
+                    T_cross = samples[i][0]
+                break
+        # 采样未达到 delta (用户手动微调过), 用自动转动段总时长近似
+        if T_cross is None and samples:
+            T_cross = samples[-1][0]
+        result = {"raw_per_deg": rpd, "ratio": rpd / 4096.0}
+        if T_cross and T_cross > 1.0:
+            v_real = 360.0 / T_cross
+            update_config({"pan_speed_dps": v_real})
+            sat_tracker.pan_speed = v_real
+            result["pan_speed_dps"] = v_real
+            result["delta_raw"] = delta
+        _encoder_cal["raw_per_deg"] = rpd
+        _save_encoder_cal()
+        with tracker.lock:
+            tracker._finalize()
+            tracker.pan_accum = 0.0
+        _last_pan_cont = None
+        with _auto_calib_lock:
+            _auto_calib["phase"] = "done"
+        return ok(result)
+
+    return err("action 需为 start / confirm")
+
+
 if __name__ == "__main__":
     satellite.start_background_jobs()  # 后台: TLE 6h / 过境 10min
     port = int(os.getenv("PTZ_PORT", "8090"))

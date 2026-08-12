@@ -505,6 +505,57 @@
     encCalAction('add_point', a);
   };
 
+  // ===== 自动转一圈标定 =====
+  async function pollAutoCalib() {
+    try {
+      const r = await fetch('/api/encoder/autocalib');
+      const d = await r.json();
+      if (!d.ok) return;
+      const st = $('encAutoStatus'), bConf = $('btnEncAutoConfirm');
+      if (!st) return;
+      if (d.status === 'turning') {
+        st.innerHTML = `⏳ 转动中… ${d.elapsed}s（约 1 分钟），请等待停止`;
+        bConf.style.display = 'none';
+      } else if (d.status === 'awaiting_confirm') {
+        st.innerHTML = '✋ 转动完成，请用方向键把云台调回物理 0°，然后点"已调回 0°，确认"';
+        bConf.style.display = '';
+      } else if (d.status === 'done') {
+        st.innerHTML = '✅ 自动标定完成，rpd 与水平速度已保存';
+        bConf.style.display = 'none';
+      } else {
+        st.innerHTML = '';
+        bConf.style.display = 'none';
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+
+  async function autoCalibAction(action) {
+    try {
+      const r = await fetch('/api/encoder/autocalib', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action })
+      });
+      const d = await r.json();
+      if (d.ok) {
+        if (action === 'start') {
+          toast('开始自动标定');
+        } else {
+          $('encCalResult').textContent =
+            `自动标定: ${d.raw_per_deg.toFixed(3)} raw/度, 传动比 ${d.ratio.toFixed(3)}:1` +
+            (d.pan_speed_dps ? `, 水平速度已校准 ${d.pan_speed_dps.toFixed(3)}°/s` : '');
+          toast('自动标定完成');
+          loadEncCal();
+        }
+      } else {
+        toast(d.detail || '操作失败');
+      }
+    } catch (e) { toast('操作失败: ' + e.message); }
+  }
+
+  $('btnEncAuto').onclick = () => autoCalibAction('start');
+  $('btnEncAutoConfirm').onclick = () => autoCalibAction('confirm');
+
   // ===== 云台跟踪 =====
   $('btnTrack').onclick = async () => {
     if (!currentNorad) { toast('请先选择卫星'); return; }
@@ -563,4 +614,5 @@
   restoreTracking();
   setInterval(loadFavorites, 30000);
   setInterval(pollEncoderCal, 500);
+  setInterval(pollAutoCalib, 500);
 })();

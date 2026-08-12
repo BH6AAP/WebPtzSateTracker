@@ -379,6 +379,11 @@
             <input id="encCorrAngle" type="number" value="180" min="0.5" max="359.5" step="0.5" style="width:70px;padding:5px;border-radius:6px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-size:12px;">
             <button class="btn-save" id="btnEncCorrect" style="background:#7c3aed;margin:0;flex:1;">转到实际位置后点校正</button>
           </div>
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
+            <button class="btn-save" id="btnEncAuto" style="background:#0ea5e9;margin:0;flex:1;">⚙ 自动转一圈标定</button>
+            <button class="btn-save" id="btnEncAutoConfirm" style="background:#16a34a;margin:0;flex:1;display:none;">✔ 已调回 0°，确认</button>
+          </div>
+          <div id="encAutoStatus" style="font-size:11px;color:#94a3b8;margin-bottom:10px;"></div>
           <div style="font-size:11px;color:#64748b;">当前已标定每度 raw 数: <b id="encCalRpd" style="color:#4ade80;">-</b></div>
           <div class="cal-result" id="encCalResult"></div>
           <div style="font-size:11px;color:#64748b;margin-top:8px;">提示：① 用复位/方向键把云台对准 0° 后设 0 点；②③④ 依次转到各刻度并记录；完成后点"完成标定"自动拟合。验证偏了用"校正"：转到实际位置(如 180°)输入实际角度点校正，再点完成标定重新拟合。<br>⚠ 全程请同一方向（顺时针）转到位置，勿反向微调，避免齿轮回差。</div>
@@ -865,7 +870,7 @@ setInterval(pollPosition, 500);
 setInterval(pollEncoder, 500);
 setInterval(pollSerialLog, 800);
 </script>
-<script src="satellite.js?v=19"></script>
+<script src="satellite.js?v=20"></script>
 <script>
 // ===== 登录状态管理器 =====
 (function () {
