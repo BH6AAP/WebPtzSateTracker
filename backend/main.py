@@ -114,6 +114,11 @@ def _auth_check():
 
 
 # ---------- 用户认证 ----------
+# 会话 cookie 持久化: 30 天内刷新/重启浏览器均保持登录
+app.config["PERMANENT_SESSION_LIFETIME"] = 30 * 24 * 3600
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
 @app.route("/api/auth/login", methods=["POST"])
 def auth_login():
     data = request.get_json(silent=True) or {}
@@ -124,8 +129,9 @@ def auth_login():
     user = auth.authenticate(username, password)
     if user is None:
         return err("用户名或密码错误", 401)
+    session.permanent = True
     session["user"] = user
-    return ok(user)
+    return ok({"user": user})
 
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -139,7 +145,7 @@ def auth_me():
     user = session.get("user")
     if user is None:
         return err("未登录", 401)
-    return ok(user)
+    return ok({"user": user})
 pelco = PelcoD(address=PTZ_ADDRESS)
 
 # ---------- 串口管理 ----------
@@ -332,10 +338,8 @@ class PositionTracker:
             tilt -= tilt_delta
         if "left" in direction:
             pan -= pan_delta
-            self.pan_accum -= pan_delta
         if "right" in direction:
             pan += pan_delta
-            self.pan_accum += pan_delta
         self.pan, self.tilt = pan, tilt
         self._clamp()
         self._moving = None
@@ -506,13 +510,20 @@ def _pan_delta(az: float, pan: float) -> float:
 
 
 def _reset_loop(tilt_s: float):
-    """复位: 水平轴用 AS5600 闭环走最短路径回 0°, 俯仰轴按时长回 0°
-    每 100ms 读取 AS5600 实时 pan, 按最短路径方向转动, 到位即停
+    """复位按钮: 水平轴按最短路径回 0° (AS5600 闭环), 俯仰轴按时长回 0°
+    防缠绕解缠由"防缠绕复位"按钮负责, 复位仅负责回 0 点。
+    每 100ms 读取实时反馈, 到位即停; 加超时兜底防止反馈失效时无限转动。
     """
+    pan, _ = _sat_get_position()
+    daz0 = _pan_delta(0.0, pan)
+    pan_deadline = time.time() + max(30.0, abs(daz0) / get_cfg("pan_speed_dps") + 10)
     start = time.time()
     pan_done = False
     tilt_done = False
+    pan_dir = "left"
     while not (pan_done and tilt_done):
+        if time.time() > pan_deadline:
+            pan_done = True
         elapsed = time.time() - start
         tilt_done = elapsed >= tilt_s
         if not pan_done:
@@ -520,13 +531,15 @@ def _reset_loop(tilt_s: float):
             daz = _pan_delta(0.0, pan)
             if abs(daz) <= 0.5:
                 pan_done = True
+            else:
+                pan_dir = "left" if daz < 0 else "right"
         if pan_done and tilt_done:
             break
         try:
             if not pan_done and not tilt_done:
-                send(pelco.up_right() if daz > 0 else pelco.up_left())
+                send(pelco.up_left() if pan_dir == "left" else pelco.up_right())
             elif not pan_done:
-                send(pelco.right() if daz > 0 else pelco.left())
+                send(pelco.left() if pan_dir == "left" else pelco.right())
             elif not tilt_done:
                 send(pelco.up())
         except Exception:  # noqa: BLE001
@@ -540,7 +553,8 @@ def _reset_loop(tilt_s: float):
         tracker.pan = 0.0
         tracker.tilt = 0.0
         tracker._pan_base, tracker._tilt_base = 0.0, 0.0
-        tracker.pan_accum = 0.0  # 复位后清零累计
+        tracker.pan_accum = 0.0  # 复位后清零累计 (重新开始记录)
+    _reanchor_zero()  # AS5600 以当前 raw 为新基准, 0 点对齐 (消除累计漂移)
 
 
 sat_tracker = satellite.SatelliteTracker(_sat_send_dir, _sat_get_position, _sat_set_position)
@@ -633,10 +647,14 @@ def static_files(filename: str):
 def status():
     try:
         ser = get_serial()
+        # ESP32/UDP 在线状态: 编码器数据 2s 内有更新则在线
+        enc_time = _encoder_state.get("time", 0.0)
+        udp_online = (time.time() - enc_time) < 2.0
         return ok({"port": SERIAL_PORT, "baud": BAUD_RATE,
                    "address": PTZ_ADDRESS, "open": ser.is_open,
                    "paused": is_paused(),
                    "resetting": is_resetting(),
+                   "udp_online": udp_online,
                    "pan_speed_dps": get_cfg("pan_speed_dps"),
                    "tilt_speed_dps": get_cfg("tilt_speed_dps"),
                    "pan_range": [get_cfg("pan_min"), get_cfg("pan_max")],
@@ -701,6 +719,44 @@ def move(direction: str):
         return ok({"direction": direction, "blocked": True, "detail": "已达限位"})
     start_hold(direction)
     return ok({"direction": direction})
+
+
+@app.route("/api/pulse", methods=["POST"])
+def pulse():
+    """点动脉冲: 朝指定方向转动固定时长 (短按触发)
+    水平轴用 AS5600 实测实际转过角度并返回; 俯仰轴按速度×时长估算。
+    """
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get("dir", "")).strip().lower()
+    ms = float(data.get("ms", 200) or 200)
+    if direction not in _MOVE_CMDS:
+        return err("无效方向")
+    if is_resetting():
+        return err("正在复位，请稍后", 409)
+    if sat_tracker.is_tracking():
+        sat_tracker.stop()
+    ms = max(50.0, min(2000.0, ms))
+    # 起始连续 pan (raw 域闭环实测, 未标定返回 None)
+    with _encoder_lock:
+        start_cont = _encoder_state.get("cont_raw")
+    start_pan = _pan_cont_from_raw(start_cont) if start_cont is not None else None
+    # 按固定时长转动 (复用持续转动机制, 与其他控制互斥)
+    start_hold(direction, check_limit=False)
+    time.sleep(ms / 1000.0)
+    stop_hold()
+    # 结束连续 pan, 计算有向增量 (右转正, 左转负)
+    delta = None
+    with _encoder_lock:
+        end_cont = _encoder_state.get("cont_raw")
+    if start_pan is not None and end_cont is not None:
+        d = _pan_cont_from_raw(end_cont) - start_pan
+        delta = round(d, 2)
+    if delta is None and ("up" in direction or "down" in direction):
+        speed = get_cfg("tilt_up_speed_dps" if "up" in direction else "tilt_down_speed_dps")
+        delta = round(speed * ms / 1000.0, 2)
+        if "down" in direction:
+            delta = -delta
+    return ok({"direction": direction, "ms": ms, "delta": delta})
 
 
 @app.route("/api/move/to", methods=["POST"])
@@ -814,20 +870,24 @@ def anti_tangle_reset():
         return ok({"detail": "无需防缠绕复位", "accum": 0, "duration": 0})
     direction = "left" if accum > 0 else "right"
     pan_speed = get_cfg("pan_speed_dps")
-    duration = abs(accum) / pan_speed + 1.0  # 加 1s 冗余补偿启停
+    duration = abs(accum) / pan_speed + 1.0  # 估算时长 (仅用于前端按钮恢复)
     set_resetting(True)
 
     def _run():
         try:
-            tracker.start_move(direction)
-            start_t = time.time()
-            while time.time() - start_t < duration:
+            # 用 AS5600 反馈闭环回退: 持续反向转动, 直到累计归零 (回到无缠绕起点)
+            # 比时间估算精确, 且能正确处理多圈缠绕
+            timeout = time.time() + max(30.0, abs(accum) / pan_speed * 2 + 5)
+            while time.time() < timeout:
+                with tracker.lock:
+                    remaining = tracker.pan_accum
+                if abs(remaining) < 1.0:
+                    break
                 try:
                     send(_MOVE_CMDS[direction]())
                 except Exception:  # noqa: BLE001
                     break
-                time.sleep(0.1)
-            tracker.stop()
+                time.sleep(0.05)
             try:
                 send(pelco.stop())
             except Exception:  # noqa: BLE001
@@ -838,6 +898,7 @@ def anti_tangle_reset():
             with tracker.lock:
                 tracker._finalize()
                 tracker.pan_accum = 0.0  # 防缠绕复位后清零
+            _reanchor_zero()  # 回到 0° 起点, AS5600 基准对齐
             set_resetting(False)
 
     threading.Thread(target=_run, daemon=True).start()
@@ -873,6 +934,8 @@ def calibrate():
             with tracker.lock:
                 tracker._finalize()
                 tracker.pan_accum = 0.0
+                global _last_pan_cont
+                _last_pan_cont = None
     threading.Thread(target=_run, daemon=True).start()
     return ok({"direction": direction, "duration": duration})
 
@@ -1037,23 +1100,67 @@ def sat_favorites_del(norad: str):
 
 
 # ---------- AS5600 磁编码器回传(水平轴位置校正) ----------
-_encoder_state = {"time": 0.0, "angle": None, "raw": None, "pan": None}
+_encoder_state = {"time": 0.0, "angle": None, "raw": None, "pan": None, "cont_raw": None}
 _encoder_lock = threading.Lock()
 
 ENCODER_CAL_FILE = os.path.join(BASE_DIR, "encoder_cal.json")
-# 两点线性标定: as5600_angle -> pan
-# points: [{"as5600_angle": 0, "pan": 0}, {"as5600_angle": 720, "pan": 360}]
-_encoder_cal = {"points": []}
+
+
+class As5600Raw:
+    """AS5600 原始计数(0~4095)多圈跟踪器
+    全部在 raw 整数域计算, 避免角度浮点累计误差。
+    - cont_raw = 圈数*4096 + raw, 跨 4095/0 线自动 ±4096
+    - deadzone: 静止死区, 小于该值增量视为抖动不累计 (防随机游走漂移)
+    """
+    RAW_PER_REV = 4096
+
+    def __init__(self, deadzone: int = 15):
+        self.cont_raw = None
+        self._last_raw = None
+        self._deadzone = deadzone
+
+    def update(self, raw: int) -> int:
+        raw = int(raw) & 0x0FFF
+        if self._last_raw is None:
+            self.cont_raw = raw
+        else:
+            d = raw - self._last_raw
+            if d > 2048:
+                d -= self.RAW_PER_REV
+            elif d < -2048:
+                d += self.RAW_PER_REV
+            if abs(d) < self._deadzone:
+                d = 0
+            self.cont_raw += d
+        self._last_raw = raw
+        return self.cont_raw
+
+    def reset(self):
+        """重置多圈基准: 下一次 update 以当前 raw 重新开始计数"""
+        self.cont_raw = None
+        self._last_raw = None
+
+
+_as5600 = As5600Raw()
+
+# raw 标定: raw_per_deg 每度raw数(持久化, 物理传动属性); origin 零点 cont_raw(内存)
+# 旧格式 points 仅作角度兜底, 不再用于新计算
+_encoder_cal = {"raw_per_deg": None}
+_cal_origin = None      # 0 点对应的 cont_raw (标定一圈完成/设0点/复位时更新)
+_cal_start = None       # 标定一圈起点 cont_raw
 
 
 def _load_encoder_cal():
     global _encoder_cal
+    _encoder_cal = {"raw_per_deg": None}
     try:
         if os.path.exists(ENCODER_CAL_FILE):
             with open(ENCODER_CAL_FILE, "r", encoding="utf-8") as f:
-                _encoder_cal = json.load(f)
+                d = json.load(f)
+                if isinstance(d, dict) and d.get("raw_per_deg"):
+                    _encoder_cal["raw_per_deg"] = float(d["raw_per_deg"])
     except Exception:  # noqa: BLE001
-        _encoder_cal = {"points": []}
+        _encoder_cal = {"raw_per_deg": None}
 
 
 def _save_encoder_cal():
@@ -1064,58 +1171,96 @@ def _save_encoder_cal():
         print(f"[encoder_cal] save error: {e!r}", flush=True)
 
 
-def _encoder_angle_to_pan(angle):
-    """根据标定点把 AS5600 角度映射为云台 pan (0~360° 连续)
-    - 0 点: 1:1 透传
-    - 1 点: 平移 (offset) 映射
-    - >=2 点: 线性比例映射
+def _pan_from_cont_raw(cont_raw):
+    """连续 raw -> 云台 pan (0~360°), 未标定返回 None"""
+    rpd = _encoder_cal.get("raw_per_deg")
+    if not rpd or _cal_origin is None or cont_raw is None:
+        return None
+    return ((cont_raw - _cal_origin) / rpd) % 360.0
+
+
+def _pan_cont_from_raw(cont_raw):
+    """连续 raw -> 连续 pan (不取模, 防缠绕累计用), 未标定返回 None"""
+    rpd = _encoder_cal.get("raw_per_deg")
+    if not rpd or _cal_origin is None or cont_raw is None:
+        return None
+    return (cont_raw - _cal_origin) / rpd
+
+
+def _reanchor_zero():
+    """云台物理回到 0° 后调用: 以当前 raw 为新基准重新计数并对齐 0 点
+    消除复位/标定过程中 AS5600 多圈累计的漂移。
     """
-    points = _encoder_cal.get("points", [])
-    if not points:
-        return float(angle) % 360.0
-    pts = sorted(points, key=lambda x: x["as5600_angle"])
-    if len(pts) == 1:
-        a0, p0 = pts[0]["as5600_angle"], pts[0]["pan"]
-        return (float(angle) - a0 + p0) % 360.0
-    a0, p0 = pts[0]["as5600_angle"], pts[0]["pan"]
-    a1, p1 = pts[-1]["as5600_angle"], pts[-1]["pan"]
-    if a1 == a0:
-        return p0 % 360.0
-    # 线性映射后取模 (支持 as5600 多圈对应云台一圈)
-    pan = p0 + (float(angle) - a0) * (p1 - p0) / (a1 - a0)
-    return pan % 360.0
+    global _cal_origin, _last_pan_cont
+    with _encoder_lock:
+        raw = _encoder_state.get("raw")
+    _as5600.reset()
+    _cal_origin = raw
+    _last_pan_cont = None
+
+
+# 上一次连续 pan (raw 域), 用于增量累计防缠绕
+_last_pan_cont = None
 
 
 _load_encoder_cal()
 
 
 def _process_encoder_data(angle, raw):
-    """处理 AS5600 编码器数据, 更新水平轴位置 (HTTP POST 和 UDP 共用)"""
+    """处理 AS5600 编码器数据, 更新水平轴位置 (HTTP POST 和 UDP 共用)
+    raw 域: _as5600 多圈展开 -> 连续 raw -> 标定映射 pan / 连续 pan (防缠绕增量)
+    angle 仅作兜底 (固件 unwrap 连续角度, 未标定或 raw 缺失时用)。
+    """
+    global _last_pan_cont
     now = time.time()
     pan = None
-    if angle is not None:
+    cont_raw = None
+    if raw is not None:
         try:
-            angle = float(angle)
-            pan = _encoder_angle_to_pan(angle)
+            cont_raw = _as5600.update(raw)
+            pan = _pan_from_cont_raw(cont_raw)
         except (ValueError, TypeError):
             pass
-    if pan is None and raw is not None:
+    if pan is None and angle is not None:
         try:
-            angle = int(raw) * 360.0 / 4096.0
-            pan = _encoder_angle_to_pan(angle)
+            angle = float(angle)
+            # 未标定或 raw 缺失时, 直接透传固件角度 (不折叠, 与旧行为一致)
+            pan = float(angle) % 360.0
         except (ValueError, TypeError):
             pass
     if pan is None:
         return
+    # 防缠绕累计: raw 域连续 pan 增量 (跨 4096/0 线已由多圈展开处理, 无跳变)
+    if cont_raw is not None:
+        cont_pan = _pan_cont_from_raw(cont_raw)
+        if cont_pan is not None:
+            if _last_pan_cont is not None:
+                delta = cont_pan - _last_pan_cont
+                # 异常跳变(复位/标定瞬间) 视为 0, 不污染累计
+                if abs(delta) <= 180.0:
+                    with tracker.lock:
+                        tracker.pan_accum += delta
+            _last_pan_cont = cont_pan
     with _encoder_lock:
         _encoder_state["time"] = now
         _encoder_state["angle"] = angle
         _encoder_state["raw"] = raw
+        _encoder_state["cont_raw"] = cont_raw
         _encoder_state["pan"] = pan
     with tracker.lock:
         if tracker._moving is not None:
+            direction, start = tracker._moving
+            elapsed = now - start
+            if elapsed > 0:
+                _, tilt_delta = tracker._angle_for_time(elapsed, direction)
+                if "up" in direction:
+                    tracker._tilt_base += tilt_delta
+                if "down" in direction:
+                    tracker._tilt_base -= tilt_delta
+                tracker.tilt = tracker._tilt_base
+                tracker._clamp()
             tracker._pan_base = pan
-            tracker._moving = (tracker._moving[0], now)
+            tracker._moving = (direction, now)
         tracker.pan = pan
 
 
@@ -1141,27 +1286,17 @@ threading.Thread(target=_udp_encoder_listener, daemon=True).start()
 
 @app.route("/api/encoder", methods=["POST"])
 def encoder_post():
-    """接收 AS5600 磁编码器数据 (HTTP POST 兼容保留)"""
+    """接收 AS5600 磁编码器数据 (HTTP POST 兼容保留, UDP 为主)"""
     data = request.get_json(silent=True) or {}
-    angle = data.get("angle")
     raw = data.get("raw")
-    pan = None
-    if angle is not None:
-        try:
-            angle = float(angle)
-            pan = _encoder_angle_to_pan(angle)
-        except (ValueError, TypeError):
-            pass
-    if pan is None and raw is not None:
-        try:
-            angle = int(raw) * 360.0 / 4096.0
-            pan = _encoder_angle_to_pan(angle)
-        except (ValueError, TypeError):
-            pass
-    if pan is None:
-        return err("缺少有效的 angle 或 raw")
+    angle = data.get("angle")
+    if raw is None and angle is None:
+        return err("缺少 raw 或 angle")
     _process_encoder_data(angle, raw)
-    return ok({"angle": angle, "raw": raw, "pan": pan})
+    with _encoder_lock:
+        st = dict(_encoder_state)
+    return ok({"raw": raw, "angle": angle,
+               "pan": st.get("pan"), "cont_raw": st.get("cont_raw")})
 
 
 @app.route("/api/encoder", methods=["GET"])
@@ -1172,56 +1307,76 @@ def encoder_get():
 
 @app.route("/api/encoder/calibrate", methods=["GET", "POST"])
 def encoder_calibrate():
-    """标定: 记录 AS5600 角度与云台 pan 的两点对应关系"""
-    global _encoder_cal
+    """AS5600 raw 域标定 (三步):
+    1. set_origin   : 云台对准 0°, 记录当前 cont_raw 为 0 点
+    2. round_start  : 记录顺时针转一圈的起点 cont_raw
+    3. round_end    : 转满 360° 回到起点, raw_per_deg = 变化量/360
+    完成后 raw_per_deg 持久化, 后期计算全在 raw 整数域进行。
+    """
+    global _cal_origin, _cal_start, _last_pan_cont
     if request.method == "GET":
         with _encoder_lock:
             latest = dict(_encoder_state)
-        return ok({"cal": _encoder_cal, "latest": latest})
+        rpd = _encoder_cal.get("raw_per_deg")
+        return ok({"cal": _encoder_cal, "latest": latest,
+                   "origin": _cal_origin, "cal_start": _cal_start,
+                   "ratio": (rpd / 4096.0) if rpd else None,
+                   "pan": _pan_from_cont_raw(latest.get("cont_raw")),
+                   "pan_cont": _pan_cont_from_raw(latest.get("cont_raw"))})
 
     data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    if action not in ("set_origin", "round_start", "round_end"):
+        return err("action 需为 set_origin / round_start / round_end")
 
-    # 直接设置标定点: [{"as5600_angle": 0, "pan": 0}, ...] (1 点=仅偏移, 2 点=比例)
-    points = data.get("points")
-    if points is not None:
-        try:
-            pts = [{"as5600_angle": float(p["as5600_angle"]),
-                    "pan": float(p["pan"])} for p in points]
-            if not pts:
-                return err("标定点不能为空")
-            _encoder_cal["points"] = pts
-            _save_encoder_cal()
-            with _encoder_lock:
-                angle = _encoder_state.get("angle")
-            # 标定后清零防缠绕累计
-            with tracker.lock:
-                tracker._finalize()
-                tracker.pan_accum = 0.0
-            return ok({"cal": _encoder_cal,
-                       "mapped_pan": _encoder_angle_to_pan(angle) if angle is not None else None})
-        except (KeyError, ValueError, TypeError):
-            return err("points 格式错误, 需要 [{as5600_angle, pan}, ...]")
-
-    # 单点记录: 用当前 AS5600 角度, 标定为指定 pan
-    pan = data.get("pan")
-    if pan is not None:
-        try:
-            pan = float(pan)
-        except (ValueError, TypeError):
-            return err("pan 格式错误")
+    def _cur_cont_raw():
         with _encoder_lock:
-            angle = _encoder_state.get("angle")
-        if angle is None:
-            return err("尚未收到 AS5600 数据, 无法标定")
-        _encoder_cal["points"].append({"as5600_angle": angle, "pan": pan})
-        _save_encoder_cal()
-        # 标定后清零防缠绕累计
+            return _encoder_state.get("cont_raw")
+
+    if action == "set_origin":
+        cont = _cur_cont_raw()
+        if cont is None:
+            return err("尚未收到 AS5600 raw 数据, 请先确认 UDP 数据流")
+        _cal_origin = cont
         with tracker.lock:
             tracker._finalize()
             tracker.pan_accum = 0.0
-        return ok({"cal": _encoder_cal, "mapped_pan": _encoder_angle_to_pan(angle)})
+        _last_pan_cont = None
+        return ok({"origin": _cal_origin, "pan": _pan_from_cont_raw(cont)})
 
-    return err("请提供 points 或 pan")
+    if action == "round_start":
+        cont = _cur_cont_raw()
+        if cont is None:
+            return err("尚未收到 AS5600 raw 数据, 请先确认 UDP 数据流")
+        _cal_start = cont
+        return ok({"cal_start": _cal_start})
+
+    # round_end
+    cont = _cur_cont_raw()
+    if cont is None or _cal_start is None:
+        return err("请先执行 round_start")
+    try:
+        angle_deg = float(data.get("angle_deg", 360))
+    except (ValueError, TypeError):
+        return err("angle_deg 格式错误")
+    if angle_deg <= 0:
+        return err("angle_deg 必须大于 0")
+    delta = cont - _cal_start
+    if delta == 0:
+        return err(f"未检测到转动: 起点 {_cal_start} -> 当前 {cont} (请确认转满一圈)")
+    # 注意: AS5600 转向可能与云台相反, raw_per_deg 带符号, 由线性映射自动处理
+    rpd = delta / angle_deg
+    _encoder_cal["raw_per_deg"] = rpd
+    _save_encoder_cal()
+    if _cal_origin is None:
+        _cal_origin = _cal_start
+    with tracker.lock:
+        tracker._finalize()
+        tracker.pan_accum = 0.0
+    _last_pan_cont = None
+    return ok({"cal": _encoder_cal, "origin": _cal_origin,
+               "raw_per_deg": rpd, "ratio": rpd / 4096.0,
+               "pan": _pan_from_cont_raw(cont)})
 
 
 if __name__ == "__main__":

@@ -373,6 +373,11 @@ def compute_passes(norad_id: str, hours: float = 24.0, min_elev: float = 0.0, st
         if cur is not None and el > cur["max_el"]:
             cur["max_el"] = el
             cur["max_t"] = t
+        # 检测仰角由升转降: 在粗采样(30s)下会错过峰值, 在峰值附近细扫 (1s) 以精确求得最大仰角
+        if cur is not None and prev_el is not None and el < prev_el and cur["max_el"] >= prev_el - 0.5:
+            peak = _refine_peak(norad_id, cur["max_t"], step)
+            if peak is not None:
+                cur["max_el"], cur["max_t"] = peak
         if prev_el is not None and prev_el >= 0 > el and cur is not None:
             # LOS
             cur["los"] = t
@@ -389,6 +394,24 @@ def compute_passes(norad_id: str, hours: float = 24.0, min_elev: float = 0.0, st
         if cur["max_el"] >= min_elev:
             passes.append(cur)
     return passes
+
+
+def _refine_peak(norad_id: str, center_t: float, coarse: float) -> tuple | None:
+    """在中心时刻附近用 1s 步长细扫, 返回 (精确最大仰角, 对应时刻)"""
+    best_el = -90.0
+    best_t = center_t
+    radius = coarse * 1.5  # 细扫窗口覆盖粗采样相邻点
+    s = max(0.0, center_t - radius)
+    e = center_t + radius
+    x = s
+    while x <= e:
+        pos = satellite_position(norad_id, x)
+        el = pos["elevation"] if pos else -90
+        if el > best_el:
+            best_el = el
+            best_t = x
+        x += 1.0
+    return (best_el, best_t)
 
 
 # ---------- 过境缓存与后台任务 ----------
@@ -517,14 +540,21 @@ class SatelliteTracker:
         """最短路径方位角差: 结果范围 [-180, 180], 自动处理 0/360 越线"""
         return (az - pan + 180) % 360 - 180
 
-    def _drive(self, direction: str, seconds: float):
-        """在指定时间内持续发送同一方向指令 (每 100ms 一帧)"""
+    def _drive(self, direction: str, seconds: float, ignore_stop: bool = False):
+        """在指定时间内持续发送同一方向指令 (每 100ms 一帧)
+        ignore_stop=True 时不检查 _stop (用于独立的 move_to 线程)
+        """
         if seconds <= 0:
             return
         end = time.time() + seconds
-        while time.time() < end and not self._stop.is_set():
+        while time.time() < end:
+            if not ignore_stop and self._stop.is_set():
+                return
             self.send_dir(direction)
-            self._stop.wait(0.1)
+            if ignore_stop:
+                time.sleep(0.1)
+            else:
+                self._stop.wait(0.1)
 
     def move_to(self, target_pan=None, target_tilt=None, timeout: float = 15.0):
         """移动到指定 pan/tilt 位置, 用于测试运动精度"""
@@ -560,51 +590,69 @@ class SatelliteTracker:
             return True
         both = min(pan_sec, tilt_sec)
         if both > 0.05 and pan_need and tilt_need:
-            self._drive(tilt_dir + pan_dir, both)
+            self._drive(tilt_dir + pan_dir, both, ignore_stop=True)
         if pan_need and pan_sec > tilt_sec + 0.05:
-            self._drive(pan_dir, pan_sec - both)
+            self._drive(pan_dir, pan_sec - both, ignore_stop=True)
         elif tilt_need and tilt_sec > pan_sec + 0.05:
-            self._drive(tilt_dir, tilt_sec - both)
+            self._drive(tilt_dir, tilt_sec - both, ignore_stop=True)
         self.send_dir("stop")
         return True
 
     def _loop(self):
-        """闭环跟踪: 每 100ms 实时算误差, 发方向指令
+        """闭环跟踪: 预测性控制, 根据卫星角速度提前瞄准
 
-        俯仰与水平整体逻辑一致, 无反馈时用"时间定步":
-        - 死区: |误差| <= 1° -> 俯仰停
-        - 步进区: 误差每超过 1° 就运行 "1°/该方向速度" 秒 (抬头/低头速度不同),
-          运行结束立即重新评估, 误差仍大则连续衔接 (实际速率≈俯仰速度)
-        - 水平连续区 (pan=move): 俯仰不阻塞, 组合持续发送快速逼近
-
-        控制周期 0.1s 与手动/标定发送间隔一致, 保证实际转动速度≈标定速度,
-        避免 0.2s 发送导致实际速度低于标定速度、估算值虚高 (越转越偏)。
+        改进点:
+        - 动态提前量: 基础 1.0s + 角速度补偿, 卫星越快提前越多
+        - 角速度预测: 记录方位/仰角变化率, 叠加反应延迟内的预测位移
+        - 小步快跑: 俯仰死区 0.5° (原 1°), 步长 0.5°, 反应更快
+        - 水平死区 0.4° (原 0.6°), 减少跟踪滞后
         """
-        cycle = 0.1  # 控制周期(秒): 与手动/标定一致 (YD3040 需持续收帧才转动)
-        deadzone = 0.6  # 水平死区(度)
-        pulse_ms = 80  # 水平脉冲持续时间(毫秒), 7.45°/s * 0.08s ≈ 0.6° (含加速实际更小)
-        move_per_cycle = self.pan_speed * cycle  # 单周期连续位移(~0.75°)
-        pulse_zone = move_per_cycle + deadzone  # 水平脉冲区上界(~1.35°)
-        tilt_step = 1.0  # 俯仰死区(度) = 步长: 误差每满 1° 运行 1°/速度 秒
-        lead_s = 0.5  # 方位角提前量(秒): 查询未来位置, LEO ~0.5-1°/s 时约 0.3° 提前
+        cycle = 0.1
+        deadzone = 0.4       # 水平死区(度)
+        move_per_cycle = self.pan_speed * cycle
+        pulse_zone = move_per_cycle + deadzone
+        tilt_step = 0.5      # 俯仰死区/步长(度): 小步快跑
+        lead_s = 1.0         # 基础提前量(秒): 查询未来位置
+        reaction_s = 0.3     # 云台反应延迟(秒): 额外预测补偿
+
+        # 角速度跟踪
+        prev_az = None
+        prev_el = None
+        prev_t = None
 
         while not self._stop.is_set():
             cycle_start = time.time()
             try:
-                sat = satellite_position(self.norad_id, time.time() + lead_s)
+                now = time.time()
+                sat = satellite_position(self.norad_id, now + lead_s)
                 if sat is None:
                     self.send_dir("stop")
                     break
                 az, el = sat["azimuth"], sat["elevation"]
 
-                pan, tilt = self.get_position()
-                daz = self._pan_delta(az, pan)
-                # tilt 约定: 0=水平(地平线), 90=天顶; 目标 tilt = 卫星仰角 el
-                del_ = el - tilt
+                # ---- 计算角速度 (用连续周期的未来位置差分) ----
+                az_rate = 0.0
+                el_rate = 0.0
+                if prev_az is not None and prev_t is not None:
+                    dt = now - prev_t
+                    if dt > 0.05:
+                        az_rate = self._pan_delta(az, prev_az) / dt
+                        el_rate = (el - prev_el) / dt
+                prev_az = az
+                prev_el = el
+                prev_t = now
 
-                # ---- 俯仰: 死区 1°, 误差每满 1° 运行 1°/速度 秒 (含限位保护) ----
+                # ---- 预测性目标: 未来位置 + 反应延迟内的位移 ----
+                az_target = az + az_rate * reaction_s
+                el_target = el + el_rate * reaction_s
+
+                pan, tilt = self.get_position()
+                daz = self._pan_delta(az_target, pan)
+                del_ = el_target - tilt
+
+                # ---- 俯仰: 小步快跑, 死区 0.5° ----
                 tilt_dir = None
-                if el > 0 and self.tilt_min <= el <= self.tilt_max:
+                if el_target > 0 and self.tilt_min <= el_target <= self.tilt_max:
                     if del_ > tilt_step:
                         tilt_dir = "up"
                     elif del_ < -tilt_step:
@@ -626,23 +674,24 @@ class SatelliteTracker:
 
                 if tilt_dir is not None and pan_mode != "stop":
                     print(f"[track] az={az:.1f} pan={pan:.1f} daz={daz:.1f} "
-                          f"el={el:.1f} tilt={tilt:.1f} del={del_:.1f} "
-                          f"pan={pan_mode} tilt={tilt_dir}", flush=True)
+                          f"az_rate={az_rate:.2f} el={el:.1f} tilt={tilt:.1f} del={del_:.1f} "
+                          f"el_rate={el_rate:.2f} pan={pan_mode} tilt={tilt_dir}", flush=True)
 
                 # ---- 发送指令 ----
                 if pan_mode == "move":
-                    # 水平连续区: 俯仰也持续转 (组合), 双向快速逼近, 不阻塞
                     self.send_dir(tilt_dir + pan_dir if tilt_dir is not None else pan_dir)
                 elif tilt_dir is not None:
-                    # 俯仰步进区: 运行 1° 所需时间 (持续发帧), 到位停后重新评估
+                    # 俯仰步进: 运行步长所需时间, 到位后重新评估
                     speed = self.tilt_up_speed if tilt_dir == "up" else self.tilt_down_speed
                     self._drive(tilt_dir, tilt_step / speed)
                     self.send_dir("stop")
                     continue
                 elif pan_mode == "pulse":
-                    # 水平脉冲: 发方向指令, 短暂延时后停
+                    # 动态时长点动: 按误差/速度计算脉冲时长, 精确消除残差
+                    # (AS5600 实测位置在下一周期作为新起点, 形成闭环修正)
+                    sec = max(0.03, adaz / self.pan_speed)
                     self.send_dir(pan_dir)
-                    time.sleep(pulse_ms / 1000.0)
+                    self._stop.wait(sec)
                     self.send_dir("stop")
                 else:
                     self.send_dir("stop")

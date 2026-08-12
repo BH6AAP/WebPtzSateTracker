@@ -8,26 +8,29 @@
   let satPosMarkers = {}; // norad -> {circle, label}
   let currentMarker = null;
   let coverageLayer = null; // 卫星覆盖范围圆
+  let followSat = false;    // 是否跟随卫星 (点击卫星后开启, 手动拖动地图时关闭)
   let tracking = false;
   let radarPoints = [];
   let radarTimer = null;
   let infoTimer = null;
   let obsMarker = null;
 
-  // ===== 地图初始化 (本地地球纹理, 等距圆柱投影) =====
+  // ===== 地图初始化 (本地地球纹理, 等距圆柱投影, 左右无缝衔接) =====
   function initMap() {
     const bounds = [[-90, -180], [90, 180]];
     map = L.map('map', {
       crs: L.CRS.EPSG4326,
       minZoom: 2, maxZoom: 6,
       zoomControl: false,
-      maxBounds: bounds,
-      maxBoundsViscosity: 1.0
+      worldCopyJump: true   // 拖过边缘自动跳转, 实现左右无缝
     });
     // 缩放按钮放置右下角
     L.control.zoom({ position: 'bottomright' }).addTo(map);
-    window.map = map;  // 暴露给其他脚本 (收起/展开时 invalidateSize)
-    L.imageOverlay('earth_diffuse.jpg', bounds).addTo(map);
+    window.map = map;
+    // 地球纹理铺 3 份, 保证左右拖动时始终有图
+    for (let off = -360; off <= 360; off += 360) {
+      L.imageOverlay('earth_diffuse.jpg', [[-90, -180 + off], [90, 180 + off]]).addTo(map);
+    }
     // 以观测站为中心并显示观测站位置
     fetch('/api/sat/observer').then(r => r.json()).then(d => {
       if (d.ok) {
@@ -187,15 +190,39 @@
     } catch (e) { toast('添加失败'); }
   }
 
+  // ===== 经度展开 (跨日界线连续化, 避免横穿地图的长线) =====
+  function unwrapLng(points) {
+    if (points.length === 0) return [];
+    const result = [[points[0][0], points[0][1]]];
+    let offset = 0;
+    for (let i = 1; i < points.length; i++) {
+      let dlon = points[i][1] - points[i - 1][1];
+      if (dlon > 180) offset -= 360;       // 179 -> -179, 补偿 -360
+      else if (dlon < -180) offset += 360;  // -179 -> 179, 补偿 +360
+      result.push([points[i][0], points[i][1] + offset]);
+    }
+    return result;
+  }
+
   // ===== 加载卫星轨迹 (星下点) =====
   async function loadTrack(norad, hours) {
     try {
       const res = await fetch('/api/sat/track/' + norad + '?hours=' + (hours || 24) + '&step=120');
       const data = await res.json();
       if (!data.ok || !data.points || data.points.length === 0) return;
-      const latlngs = data.points.map(p => [p.lat, p.lon]);
-      if (trackLayers[norad]) map.removeLayer(trackLayers[norad]);
-      trackLayers[norad] = L.polyline(latlngs, { color: '#0ea5e9', weight: 2, opacity: 0.8 }).addTo(map);
+      const raw = data.points.map(p => [p.lat, p.lon]);
+      if (trackLayers[norad]) {
+        map.removeLayer(trackLayers[norad]);
+        trackLayers[norad] = null;
+      }
+      // 展开经度使轨迹连续, 然后渲染 3 份 (-360/0/+360) 保证左右滚动都有轨迹
+      const unwrapped = unwrapLng(raw);
+      const layers = [];
+      for (let off = -360; off <= 360; off += 360) {
+        const pts = unwrapped.map(p => [p[0], p[1] + off]);
+        layers.push(L.polyline(pts, { color: '#0ea5e9', weight: 2, opacity: 0.8 }).addTo(map));
+      }
+      trackLayers[norad] = L.layerGroup(layers).addTo(map);
     } catch (e) { /* 忽略 */ }
   }
 
@@ -237,11 +264,15 @@
     loadRadar(norad);
     loadPasses(norad);
     startInfoPoll(norad);
+    // 点击卫星: 开启跟随, 地图中心移至卫星
+    followSat = true;
+    map.once('dragstart', () => { followSat = false; });  // 手动拖动时取消跟随
   }
 
   function clearSatellite() {
     currentNorad = null;
     currentSatName = null;
+    followSat = false;
     $('satInfo').innerHTML = '<div class="row"><span class="k">未选择卫星</span></div>';
     if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
     if (coverageLayer) { map.removeLayer(coverageLayer); coverageLayer = null; }
@@ -297,6 +328,8 @@
             icon: L.divIcon({ className: 'sat-label', html: labelText, iconSize: [100, 16] })
           })
         ]).addTo(map);
+        // 跟随卫星: 地图中心平滑移动到当前星下点
+        if (followSat) map.panTo([data.sub_lat, data.sub_lon], { animate: true, duration: 0.5 });
         // 雷达图当前点
         drawRadar(radarPoints, { az: data.azimuth, el: data.elevation });
       } catch (e) { /* 忽略 */ }
@@ -389,46 +422,23 @@
     }
   }
 
-  // ===== AS5600 标定 =====
-  const encCalPoints = [];
-  let encLatest = null;
-
-  function renderEncCal() {
-    $('encCalCount').textContent = encCalPoints.length;
-    const box = $('encCalPoints');
-    if (!encCalPoints.length) {
-      box.innerHTML = '<div style="text-align:center;padding:8px 0;">暂无</div>';
-      return;
-    }
-    box.innerHTML = encCalPoints.map((p, i) =>
-      `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #1e293b;">
-        <span>#${i + 1} AS:${p.as5600_angle.toFixed(1)}° → 真实:${p.pan.toFixed(1)}°</span>
-        <button data-idx="${i}" style="padding:2px 6px;border:none;border-radius:4px;background:#64748b;color:#fff;font-size:11px;cursor:pointer;">删除</button>
-      </div>`).join('');
-    box.querySelectorAll('button').forEach(b => {
-      b.onclick = () => { encCalPoints.splice(parseInt(b.dataset.idx), 1); renderEncCal(); };
-    });
-  }
-
-  function updateEncLatest(latest) {
-    encLatest = latest || null;
-    if (!latest) return;
-    $('encCalRaw').textContent = latest.raw ?? '-';
-    $('encCalAngle').textContent = latest.angle !== null && latest.angle !== undefined ? latest.angle.toFixed(1) : '-';
-    $('encCalPan').textContent = latest.pan !== null && latest.pan !== undefined ? latest.pan.toFixed(1) : '-';
+  // ===== AS5600 标定 (raw 域三步) =====
+  function updateEncCalUi(d) {
+    const latest = d.latest || {};
+    const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+    set('encCalRaw', latest.raw ?? '-');
+    set('encCalCont', latest.cont_raw ?? '-');
+    set('encCalPan', (latest.pan !== null && latest.pan !== undefined) ? latest.pan.toFixed(2) : '-');
+    const ratio = d.ratio;
+    set('encCalRatio', ratio ? ratio.toFixed(3) + ':1' : '-');
+    set('encCalRpd', d.cal && d.cal.raw_per_deg ? d.cal.raw_per_deg.toFixed(3) : '-');
   }
 
   async function loadEncCal() {
     try {
       const r = await fetch('/api/encoder/calibrate');
       const d = await r.json();
-      if (!d.ok) return;
-      encCalPoints.length = 0;
-      if (d.cal && d.cal.points) {
-        d.cal.points.forEach(p => encCalPoints.push({ as5600_angle: p.as5600_angle, pan: p.pan }));
-      }
-      renderEncCal();
-      updateEncLatest(d.latest);
+      if (d.ok) updateEncCalUi(d);
     } catch (e) { /* 忽略 */ }
   }
 
@@ -436,47 +446,43 @@
     try {
       const r = await fetch('/api/encoder/calibrate');
       const d = await r.json();
-      if (d.ok) updateEncLatest(d.latest);
+      if (d.ok) updateEncCalUi(d);
     } catch (e) { /* 忽略 */ }
+  }
+
+  async function encCalAction(action) {
+    try {
+      const r = await fetch('/api/encoder/calibrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action })
+      });
+      const d = await r.json();
+      if (d.ok) {
+        if (action === 'set_origin') {
+          $('encCalResult').textContent = `0 点已设置 (cont_raw=${d.origin})`;
+          toast('0 点已设置');
+        } else if (action === 'round_start') {
+          $('encCalResult').textContent = `起点已记录 (cont_raw=${d.cal_start})，请顺时针转满一圈回到 0°`;
+          toast('起点已记录，开始转一圈');
+        } else {
+          $('encCalResult').textContent = `标定完成: ${d.raw_per_deg.toFixed(3)} raw/度, 传动比 ${d.ratio.toFixed(3)}:1`;
+          toast('标定完成');
+        }
+        updateEncCalUi(d);
+      } else {
+        toast((action === 'round_end' ? '完成标定失败: ' : '') + (d.detail || '操作失败'));
+      }
+    } catch (e) { toast('操作失败: ' + e.message); }
   }
 
   $('encCalToggle').onclick = () => {
     $('encCalBody').classList.toggle('hidden');
     $('encCalToggle').classList.toggle('collapsed');
   };
-  $('btnEncCalAdd').onclick = () => {
-    if (!encLatest || encLatest.angle === null || encLatest.angle === undefined) {
-      toast('尚未收到 AS5600 数据');
-      return;
-    }
-    const real = parseFloat($('encCalReal').value);
-    if (isNaN(real)) { toast('请输入云台真实水平角'); return; }
-    encCalPoints.push({ as5600_angle: encLatest.angle, pan: real });
-    renderEncCal();
-    toast('已记录标定点');
-  };
-  $('btnEncCalClear').onclick = () => {
-    encCalPoints.length = 0;
-    renderEncCal();
-    $('encCalResult').textContent = '';
-  };
-  $('btnEncCalSave').onclick = async () => {
-    if (encCalPoints.length < 1) { toast('请至少记录 1 个点'); return; }
-    try {
-      const r = await fetch('/api/encoder/calibrate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ points: encCalPoints })
-      });
-      const d = await r.json();
-      if (d.ok) {
-        $('encCalResult').textContent = '标定已保存' + (d.mapped_pan !== null && d.mapped_pan !== undefined ? `，当前映射 pan ${d.mapped_pan.toFixed(1)}°` : '');
-        toast('标定保存成功');
-      } else {
-        toast('保存失败: ' + (d.detail || ''));
-      }
-    } catch (e) { toast('保存失败: ' + e.message); }
-  };
+  $('btnEncSetOrigin').onclick = () => encCalAction('set_origin');
+  $('btnEncRoundStart').onclick = () => encCalAction('round_start');
+  $('btnEncRoundEnd').onclick = () => encCalAction('round_end');
 
   // ===== 云台跟踪 =====
   $('btnTrack').onclick = async () => {
@@ -503,11 +509,37 @@
     }
   };
 
+  // ===== 刷新后恢复跟踪状态 (后端线程仍在跟踪) =====
+  async function restoreTracking() {
+    try {
+      const r = await fetch('/api/sat/track/status');
+      const d = await r.json();
+      if (!d.ok) return;
+      if (d.tracking && d.norad) {
+        tracking = true;
+        $('btnTrack').textContent = '停止跟踪';
+        $('btnTrack').classList.add('tracking');
+        // 恢复选中的卫星视图 (轨迹/雷达/信息)
+        if (!currentNorad) {
+          const favs = document.querySelectorAll('.fav-item');
+          for (const el of favs) {
+            if (el.querySelector('.del').dataset.norad === String(d.norad)) {
+              selectSatellite(Number(d.norad), el.querySelector('.name').textContent);
+              break;
+            }
+          }
+        }
+        toast('跟踪继续进行中 (' + d.norad + ')');
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+
   // ===== 初始化 =====
   initMap();
   bindTrackDurBtns();
   loadFavorites();
   loadEncCal();
+  restoreTracking();
   setInterval(loadFavorites, 30000);
   setInterval(pollEncoderCal, 500);
 })();
