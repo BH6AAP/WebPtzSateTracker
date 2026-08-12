@@ -365,15 +365,18 @@
             <span>pan:<b id="encCalPan">-</b>°</span>
             <span>传动:<b id="encCalRatio">-</b></span>
           </div>
-          <div class="cal-title">标定流程 (raw 域)</div>
+          <div class="cal-title">标定流程 (0/90/180/270 四点多点拟合)</div>
           <div id="encCalSteps" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px;">
             <button class="btn-save" id="btnEncSetOrigin" style="background:#2563eb;margin:0;">① 设 0 点 <span style="font-weight:normal;font-size:11px;">(云台对准 0°，记录当前值)</span></button>
-            <button class="btn-save" id="btnEncRoundStart" style="background:#d97706;margin:0;">② 开始转一圈 <span style="font-weight:normal;font-size:11px;">(记起点，然后顺时针转 360°)</span></button>
-            <button class="btn-save" id="btnEncRoundEnd" style="background:#16a34a;margin:0;">③ 完成标定 <span style="font-weight:normal;font-size:11px;">(回到 0°，计算每度 raw 数)</span></button>
+            <button class="btn-save" id="btnEncAdd90" style="background:#d97706;margin:0;">② 转到 90° 记录 <span style="font-weight:normal;font-size:11px;">(方向键转到 90° 后点击)</span></button>
+            <button class="btn-save" id="btnEncAdd180" style="background:#d97706;margin:0;">③ 转到 180° 记录 <span style="font-weight:normal;font-size:11px;">(方向键转到 180° 后点击)</span></button>
+            <button class="btn-save" id="btnEncAdd270" style="background:#d97706;margin:0;">④ 转到 270° 记录 <span style="font-weight:normal;font-size:11px;">(方向键转到 270° 后点击)</span></button>
+            <button class="btn-save" id="btnEncFinish" style="background:#16a34a;margin:0;">完成标定 <span style="font-weight:normal;font-size:11px;">(四点点拟合 raw/度 并持久化)</span></button>
           </div>
+          <div id="encCalPoints" style="font-size:11px;color:#94a3b8;margin-bottom:10px;"></div>
           <div style="font-size:11px;color:#64748b;">当前已标定每度 raw 数: <b id="encCalRpd" style="color:#4ade80;">-</b></div>
           <div class="cal-result" id="encCalResult"></div>
-          <div style="font-size:11px;color:#64748b;margin-top:8px;">提示：① 用复位/方向键把云台对准 0°；② 记录起点后用方向键顺时针转满一圈回到 0°；③ 自动计算 raw/度 并持久化。</div>
+          <div style="font-size:11px;color:#64748b;margin-top:8px;">提示：① 用复位/方向键把云台对准 0° 后设 0 点；②③④ 依次转到各刻度并记录；完成后点"完成标定"自动拟合。</div>
         </div>
       </div>
 
@@ -857,7 +860,7 @@ setInterval(pollPosition, 500);
 setInterval(pollEncoder, 500);
 setInterval(pollSerialLog, 800);
 </script>
-<script src="satellite.js?v=17"></script>
+<script src="satellite.js?v=18"></script>
 <script>
 // ===== 登录状态管理器 =====
 (function () {

@@ -1146,8 +1146,8 @@ _as5600 = As5600Raw()
 # raw 标定: raw_per_deg 每度raw数(持久化, 物理传动属性); origin 零点 cont_raw(内存)
 # 旧格式 points 仅作角度兜底, 不再用于新计算
 _encoder_cal = {"raw_per_deg": None}
-_cal_origin = None      # 0 点对应的 cont_raw (标定一圈完成/设0点/复位时更新)
-_cal_start = None       # 标定一圈起点 cont_raw
+_cal_origin = None      # 0 点对应的 cont_raw (设0点/复位时更新)
+_cal_points = []        # 多点标定记录: [{"angle": 90, "cont": ...}, ...] (内存)
 
 
 def _load_encoder_cal():
@@ -1307,27 +1307,27 @@ def encoder_get():
 
 @app.route("/api/encoder/calibrate", methods=["GET", "POST"])
 def encoder_calibrate():
-    """AS5600 raw 域标定 (三步):
-    1. set_origin   : 云台对准 0°, 记录当前 cont_raw 为 0 点
-    2. round_start  : 记录顺时针转一圈的起点 cont_raw
-    3. round_end    : 转满 360° 回到起点, raw_per_deg = 变化量/360
+    """AS5600 raw 域多点标定:
+    1. set_origin : 云台对准 0°, 记录当前 cont_raw 为 0 点
+    2. add_point  : 转到 90°/180°/270° 等刻度, 逐个记录 {angle, cont_raw}
+    3. finish     : 用全部标定点对原点最小二乘拟合 raw_per_deg (消除单点误差)
     完成后 raw_per_deg 持久化, 后期计算全在 raw 整数域进行。
     """
-    global _cal_origin, _cal_start, _last_pan_cont
+    global _cal_origin, _cal_points, _last_pan_cont
     if request.method == "GET":
         with _encoder_lock:
             latest = dict(_encoder_state)
         rpd = _encoder_cal.get("raw_per_deg")
         return ok({"cal": _encoder_cal, "latest": latest,
-                   "origin": _cal_origin, "cal_start": _cal_start,
+                   "origin": _cal_origin, "points": list(_cal_points),
                    "ratio": (rpd / 4096.0) if rpd else None,
                    "pan": _pan_from_cont_raw(latest.get("cont_raw")),
                    "pan_cont": _pan_cont_from_raw(latest.get("cont_raw"))})
 
     data = request.get_json(silent=True) or {}
     action = data.get("action")
-    if action not in ("set_origin", "round_start", "round_end"):
-        return err("action 需为 set_origin / round_start / round_end")
+    if action not in ("set_origin", "add_point", "finish"):
+        return err("action 需为 set_origin / add_point / finish")
 
     def _cur_cont_raw():
         with _encoder_lock:
@@ -1338,45 +1338,56 @@ def encoder_calibrate():
         if cont is None:
             return err("尚未收到 AS5600 raw 数据, 请先确认 UDP 数据流")
         _cal_origin = cont
+        _cal_points = []
         with tracker.lock:
             tracker._finalize()
             tracker.pan_accum = 0.0
         _last_pan_cont = None
         return ok({"origin": _cal_origin, "pan": _pan_from_cont_raw(cont)})
 
-    if action == "round_start":
+    if action == "add_point":
+        if _cal_origin is None:
+            return err("请先设 0 点 (set_origin)")
         cont = _cur_cont_raw()
         if cont is None:
             return err("尚未收到 AS5600 raw 数据, 请先确认 UDP 数据流")
-        _cal_start = cont
-        return ok({"cal_start": _cal_start})
+        try:
+            angle_deg = float(data.get("angle_deg"))
+        except (ValueError, TypeError):
+            return err("angle_deg 格式错误")
+        if not (0 < angle_deg < 360):
+            return err("angle_deg 需在 (0, 360) 之间")
+        # 同角度覆盖旧点 (允许重复记录覆盖)
+        _cal_points = [p for p in _cal_points if abs(p["angle"] - angle_deg) > 0.5]
+        _cal_points.append({"angle": angle_deg, "cont": cont})
+        _cal_points.sort(key=lambda p: p["angle"])
+        return ok({"points": list(_cal_points),
+                   "count": len(_cal_points),
+                   "angle": angle_deg, "cont": cont})
 
-    # round_end
-    cont = _cur_cont_raw()
-    if cont is None or _cal_start is None:
-        return err("请先执行 round_start")
-    try:
-        angle_deg = float(data.get("angle_deg", 360))
-    except (ValueError, TypeError):
-        return err("angle_deg 格式错误")
-    if angle_deg <= 0:
-        return err("angle_deg 必须大于 0")
-    delta = cont - _cal_start
-    if delta == 0:
-        return err(f"未检测到转动: 起点 {_cal_start} -> 当前 {cont} (请确认转满一圈)")
-    # 注意: AS5600 转向可能与云台相反, raw_per_deg 带符号, 由线性映射自动处理
-    rpd = delta / angle_deg
+    # finish: 过原点最小二乘拟合 raw_per_deg (0 点为锚点)
+    if _cal_origin is None:
+        return err("请先设 0 点 (set_origin)")
+    if len(_cal_points) < 2:
+        return err(f"标定点不足 ({len(_cal_points)}/2), 请至少记录 2 个点")
+    s_aa = sum(p["angle"] ** 2 for p in _cal_points)
+    s_ad = sum(p["angle"] * (p["cont"] - _cal_origin) for p in _cal_points)
+    if abs(s_aa) < 1e-9:
+        return err("标定点数据无效")
+    rpd = s_ad / s_aa
     _encoder_cal["raw_per_deg"] = rpd
     _save_encoder_cal()
-    if _cal_origin is None:
-        _cal_origin = _cal_start
     with tracker.lock:
         tracker._finalize()
         tracker.pan_accum = 0.0
     _last_pan_cont = None
+    # 各点残差 (用于前端展示标定质量)
+    residuals = [round(p["cont"] - _cal_origin - rpd * p["angle"], 1) for p in _cal_points]
     return ok({"cal": _encoder_cal, "origin": _cal_origin,
+               "points": list(_cal_points),
                "raw_per_deg": rpd, "ratio": rpd / 4096.0,
-               "pan": _pan_from_cont_raw(cont)})
+               "residuals": residuals,
+               "pan": _pan_from_cont_raw(_cur_cont_raw())})
 
 
 if __name__ == "__main__":

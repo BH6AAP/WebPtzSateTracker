@@ -422,7 +422,7 @@
     }
   }
 
-  // ===== AS5600 标定 (raw 域三步) =====
+  // ===== AS5600 标定 (0/90/180/270 多点多点拟合) =====
   function updateEncCalUi(d) {
     const latest = d.latest || {};
     const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
@@ -432,6 +432,20 @@
     const ratio = d.ratio;
     set('encCalRatio', ratio ? ratio.toFixed(3) + ':1' : '-');
     set('encCalRpd', d.cal && d.cal.raw_per_deg ? d.cal.raw_per_deg.toFixed(3) : '-');
+    // 已记录点列表
+    const pts = d.points || [];
+    const box = $('encCalPoints');
+    if (box) {
+      if (!pts.length) {
+        box.innerHTML = '<div style="text-align:center;padding:6px 0;color:#64748b;">暂无记录点</div>';
+      } else {
+        box.innerHTML = pts.map(p => {
+          const cont = p.cont !== null && p.cont !== undefined ? p.cont : '-';
+          return `<div style="display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #1e293b;">
+            <span>${p.angle}° 点</span><span style="color:#7dd3fc;">cont=${cont}</span></div>`;
+        }).join('');
+      }
+    }
   }
 
   async function loadEncCal() {
@@ -450,28 +464,28 @@
     } catch (e) { /* 忽略 */ }
   }
 
-  async function encCalAction(action) {
+  async function encCalAction(action, angleDeg) {
     try {
       const r = await fetch('/api/encoder/calibrate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action })
+        body: JSON.stringify(action === 'add_point' ? { action, angle_deg: angleDeg } : { action })
       });
       const d = await r.json();
       if (d.ok) {
         if (action === 'set_origin') {
-          $('encCalResult').textContent = `0 点已设置 (cont_raw=${d.origin})`;
+          $('encCalResult').textContent = `0 点已设置 (cont_raw=${d.origin})，请转到 90° 记录`;
           toast('0 点已设置');
-        } else if (action === 'round_start') {
-          $('encCalResult').textContent = `起点已记录 (cont_raw=${d.cal_start})，请顺时针转满一圈回到 0°`;
-          toast('起点已记录，开始转一圈');
+        } else if (action === 'add_point') {
+          $('encCalResult').textContent = `${d.angle}° 点已记录 (cont_raw=${d.cont})，共 ${d.count} 点`;
+          toast(`${d.angle}° 点已记录`);
         } else {
           $('encCalResult').textContent = `标定完成: ${d.raw_per_deg.toFixed(3)} raw/度, 传动比 ${d.ratio.toFixed(3)}:1`;
           toast('标定完成');
         }
         updateEncCalUi(d);
       } else {
-        toast((action === 'round_end' ? '完成标定失败: ' : '') + (d.detail || '操作失败'));
+        toast((action === 'finish' ? '完成标定失败: ' : '') + (d.detail || '操作失败'));
       }
     } catch (e) { toast('操作失败: ' + e.message); }
   }
@@ -481,8 +495,10 @@
     $('encCalToggle').classList.toggle('collapsed');
   };
   $('btnEncSetOrigin').onclick = () => encCalAction('set_origin');
-  $('btnEncRoundStart').onclick = () => encCalAction('round_start');
-  $('btnEncRoundEnd').onclick = () => encCalAction('round_end');
+  $('btnEncAdd90').onclick = () => encCalAction('add_point', 90);
+  $('btnEncAdd180').onclick = () => encCalAction('add_point', 180);
+  $('btnEncAdd270').onclick = () => encCalAction('add_point', 270);
+  $('btnEncFinish').onclick = () => encCalAction('finish');
 
   // ===== 云台跟踪 =====
   $('btnTrack').onclick = async () => {
