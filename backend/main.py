@@ -1405,24 +1405,20 @@ def encoder_calibrate():
                    "count": len(_cal_points),
                    "angle": angle_deg, "cont": cont})
 
-    # finish: 带截距最小二乘拟合 raw_per_deg 与 0 点 (不再硬锚定用户设的 0 点,
-    # 由全部点共同确定, 自动修正 0 点对准误差与比例误差)
+    # finish: 0 点锁定为用户设 0 点时的物理位置(_cal_origin), 绝不重拟合!
+    # 各标定点(90/180/270...)仅用于过原点最小二乘求 rpd(斜率),
+    # 多点平均掉各点手动对准误差; 若重拟合截距作 0 点, 各点对准误差会
+    # 污染 0 点, 导致复位回到"拟合 0°"而非用户物理 0°, 偏离数度
     if _cal_origin is None:
         return err("请先设 0 点 (set_origin)")
-    if len(_cal_points) < 2:
-        return err(f"标定点不足 ({len(_cal_points)}/2), 请至少记录 2 个点")
-    pts = [(0.0, float(_cal_origin))] + [(float(p["angle"]), float(p["cont"])) for p in _cal_points]
-    n = len(pts)
-    sx = sum(a for a, _ in pts)
-    sy = sum(c for _, c in pts)
-    sxx = sum(a * a for a, _ in pts)
+    if len(_cal_points) < 1:
+        return err(f"标定点不足 ({len(_cal_points)}/1), 请至少记录 1 个点")
+    pts = [(float(p["angle"]), float(p["cont"]) - float(_cal_origin)) for p in _cal_points]
     sxy = sum(a * c for a, c in pts)
-    denom = n * sxx - sx * sx
-    if abs(denom) < 1e-9:
+    sxx = sum(a * a for a, c in pts)
+    if abs(sxx) < 1e-9:
         return err("标定点数据无效 (请确保角度各不相同)")
-    rpd = (n * sxy - sx * sy) / denom
-    origin_new = (sy - rpd * sx) / n
-    _cal_origin = origin_new
+    rpd = sxy / sxx
     _encoder_cal["raw_per_deg"] = rpd
     _save_encoder_cal()
     with tracker.lock:
