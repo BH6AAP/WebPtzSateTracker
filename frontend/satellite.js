@@ -499,6 +499,11 @@
   $('btnEncAdd180').onclick = () => encCalAction('add_point', 180);
   $('btnEncAdd270').onclick = () => encCalAction('add_point', 270);
   $('btnEncFinish').onclick = () => encCalAction('finish');
+  $('btnEncCorrect').onclick = () => {
+    const a = parseFloat(($('encCorrAngle') || {}).value);
+    if (!a || a <= 0 || a >= 360) { toast('校正角度需在 0~360 之间'); return; }
+    encCalAction('add_point', a);
+  };
 
   // ===== 云台跟踪 =====
   $('btnTrack').onclick = async () => {
