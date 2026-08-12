@@ -1111,8 +1111,11 @@ class As5600Raw:
     全部在 raw 整数域计算, 避免角度浮点累计误差。
     - cont_raw = 圈数*4096 + raw, 跨 4095/0 线自动 ±4096
     - deadzone: 静止死区, 小于该值增量视为抖动不累计 (防随机游走漂移)
-    - 动态死区: 运动期间(moving=True)死区降至 2 raw, 低速/短脉冲运动不丢失;
+    - 动态死区: 运动期间(moving=True)死区降至 1 raw, 低速/短脉冲/滑行尾段不丢失;
       静止时保持 15 raw 滤除传感器抖动
+      (实测死区 2 时 100Hz 下每帧运动增量仅 3.5 raw, 滑行尾段(<4.3°/s)被吞,
+       每次脉冲少记 ~0.5°, 跟踪中反复补差累积超前, 复位也回不到 0°; 死区 1
+       滑行衰减快几乎不吞, 10 次脉冲累计误差从 -1.2° 降至 -0.2°)
     """
     RAW_PER_REV = 4096
 
@@ -1131,7 +1134,7 @@ class As5600Raw:
                 d -= self.RAW_PER_REV
             elif d < -2048:
                 d += self.RAW_PER_REV
-            dz = 2 if moving else self._deadzone
+            dz = 1 if moving else self._deadzone
             if abs(d) < dz:
                 d = 0
             self.cont_raw += d
