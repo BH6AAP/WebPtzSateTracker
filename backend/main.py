@@ -1204,6 +1204,8 @@ def _reanchor_zero():
 
 # 上一次连续 pan (raw 域), 用于增量累计防缠绕
 _last_pan_cont = None
+# 最近一次云台运动结束时刻, 用于停驶惯性滑行段保持运动死区 (吞掉滑行量会累积超前)
+_enc_motion_end = 0.0
 
 
 def _hold_moving() -> bool:
@@ -1226,7 +1228,7 @@ def _process_encoder_data(angle, raw):
     raw 域: _as5600 多圈展开 -> 连续 raw -> 标定映射 pan / 连续 pan (防缠绕增量)
     angle 仅作兜底 (固件 unwrap 连续角度, 未标定或 raw 缺失时用)。
     """
-    global _last_pan_cont
+    global _last_pan_cont, _enc_motion_end
     now = time.time()
     pan = None
     cont_raw = None
@@ -1234,6 +1236,13 @@ def _process_encoder_data(angle, raw):
     moving = (sat_tracker.is_tracking()
               or is_resetting()
               or _hold_moving())
+    if moving:
+        _enc_motion_end = now
+    else:
+        # 停止后 1s 内仍用运动死区: 电机断电后惯性滑行段增量渐减,
+        # 若立即切回静止死区 15 raw 会吞掉尾段滑行量, 导致每次步进
+        # AS5600 显示比物理少 0.4~1°, 跟踪中反复补差形成累积超前
+        moving = (now - _enc_motion_end) < 1.0
     if raw is not None:
         try:
             cont_raw = _as5600.update(raw, moving=moving)
@@ -1547,11 +1556,12 @@ def encoder_autocalib():
             return err("尚未收到 AS5600 raw 数据")
         delta = c1 - c0
         if abs(delta) < 12000 or abs(delta) > 20000:
-            return err(f"转过的 raw 量异常 ({delta}), 请确认云台已回到物理 0° 附近 (一圈约 ±16384)")
+            return err(f"转过的 raw 量异常 ({delta}), 请确认云台已回到物理 0° 附近 (一圈约 ±16400)")
         rpd = delta / 360.0
-        # 速度校准: 从采样找 |cont-c0| 首次达到 |delta| 的时刻 (线性插值)
+        # 速度校准: 固定以 AS5600 4圈(=16384 raw, 物理一圈误差<0.1%)为目标,
+        # 从采样找增量达到 16384 的时刻, 与用户微调量无关, 稳定
         T_cross = None
-        target = abs(delta)
+        target = 16384
         for i in range(1, len(samples)):
             d_prev = abs(samples[i - 1][1] - c0) if samples[i - 1][1] is not None else 0.0
             d_cur = abs(samples[i][1] - c0) if samples[i][1] is not None else 0.0
