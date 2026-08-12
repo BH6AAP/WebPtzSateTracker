@@ -1207,8 +1207,15 @@ _last_pan_cont = None
 
 
 def _hold_moving() -> bool:
-    """持续转动/点动脉冲是否进行中 (UDP 线程只读, GIL 下安全)"""
-    return tracker._moving is not None
+    """持续转动/点动脉冲/自动标定转动是否进行中 (UDP 线程只读, GIL 下安全)
+    自动标定转动是直发指令, 不经 start_hold, 需单独纳入运动判定,
+    否则静止死区会吞掉 100Hz 下每帧 3.5 raw 的增量, 导致 cont_raw 不累计"""
+    if tracker._moving is not None:
+        return True
+    try:
+        return _auto_calib["phase"] == "turning"
+    except NameError:
+        return False
 
 
 _load_encoder_cal()
