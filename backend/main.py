@@ -1157,22 +1157,29 @@ _cal_points = []        # 多点标定记录: [{"angle": 90, "cont": ...}, ...] 
 
 
 def _load_encoder_cal():
-    global _encoder_cal
+    global _encoder_cal, _cal_origin
     _encoder_cal = {"raw_per_deg": None}
+    _cal_origin = None
     try:
         if os.path.exists(ENCODER_CAL_FILE):
             with open(ENCODER_CAL_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-                if isinstance(d, dict) and d.get("raw_per_deg"):
-                    _encoder_cal["raw_per_deg"] = float(d["raw_per_deg"])
+                if isinstance(d, dict):
+                    if d.get("raw_per_deg"):
+                        _encoder_cal["raw_per_deg"] = float(d["raw_per_deg"])
+                    if d.get("origin") is not None:
+                        _cal_origin = int(d["origin"])
     except Exception:  # noqa: BLE001
         _encoder_cal = {"raw_per_deg": None}
+        _cal_origin = None
 
 
 def _save_encoder_cal():
     try:
+        data = dict(_encoder_cal)
+        data["origin"] = _cal_origin
         with open(ENCODER_CAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(_encoder_cal, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:  # noqa: BLE001
         print(f"[encoder_cal] save error: {e!r}", flush=True)
 
@@ -1203,6 +1210,7 @@ def _reanchor_zero():
     _as5600.reset()
     _cal_origin = raw
     _last_pan_cont = None
+    _save_encoder_cal()  # 复位后 0 点变化, 持久化防重启丢失
 
 
 # 上一次连续 pan (raw 域), 用于增量累计防缠绕
@@ -1370,6 +1378,7 @@ def encoder_calibrate():
             return err("尚未收到 AS5600 raw 数据, 请先确认 UDP 数据流")
         _cal_origin = cont
         _cal_points = []
+        _save_encoder_cal()  # origin 持久化, 重启服务不丢标定
         with tracker.lock:
             tracker._finalize()
             tracker.pan_accum = 0.0
