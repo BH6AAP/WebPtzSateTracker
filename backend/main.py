@@ -1111,6 +1111,8 @@ class As5600Raw:
     全部在 raw 整数域计算, 避免角度浮点累计误差。
     - cont_raw = 圈数*4096 + raw, 跨 4095/0 线自动 ±4096
     - deadzone: 静止死区, 小于该值增量视为抖动不累计 (防随机游走漂移)
+    - 动态死区: 运动期间(moving=True)死区降至 2 raw, 低速/短脉冲运动不丢失;
+      静止时保持 15 raw 滤除传感器抖动
     """
     RAW_PER_REV = 4096
 
@@ -1119,7 +1121,7 @@ class As5600Raw:
         self._last_raw = None
         self._deadzone = deadzone
 
-    def update(self, raw: int) -> int:
+    def update(self, raw: int, moving: bool = False) -> int:
         raw = int(raw) & 0x0FFF
         if self._last_raw is None:
             self.cont_raw = raw
@@ -1129,7 +1131,8 @@ class As5600Raw:
                 d -= self.RAW_PER_REV
             elif d < -2048:
                 d += self.RAW_PER_REV
-            if abs(d) < self._deadzone:
+            dz = 2 if moving else self._deadzone
+            if abs(d) < dz:
                 d = 0
             self.cont_raw += d
         self._last_raw = raw
@@ -1203,6 +1206,11 @@ def _reanchor_zero():
 _last_pan_cont = None
 
 
+def _hold_moving() -> bool:
+    """持续转动/点动脉冲是否进行中 (UDP 线程只读, GIL 下安全)"""
+    return tracker._moving is not None
+
+
 _load_encoder_cal()
 
 
@@ -1215,9 +1223,13 @@ def _process_encoder_data(angle, raw):
     now = time.time()
     pan = None
     cont_raw = None
+    # 动态死区: 云台运动期间死区降至 2 raw (低速/短脉冲运动不丢失)
+    moving = (sat_tracker.is_tracking()
+              or is_resetting()
+              or _hold_moving())
     if raw is not None:
         try:
-            cont_raw = _as5600.update(raw)
+            cont_raw = _as5600.update(raw, moving=moving)
             pan = _pan_from_cont_raw(cont_raw)
         except (ValueError, TypeError):
             pass

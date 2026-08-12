@@ -7,7 +7,7 @@ from wifi_manager import WiFiManager
 
 # ========== 配置 ==========
 UDP_PORT  = 8091       # UDP 广播端口 (后端监听此端口)
-SEND_MS   = 100        # 发送间隔(ms)
+SEND_MS   = 20         # 发送间隔(ms): 50Hz, 降低反馈延迟 (原 100ms/10Hz)
 STATE_FILE = "as5600_state.txt"
 
 # AS5600 接线: SCL -> GPIO11, SDA -> GPIO12
