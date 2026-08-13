@@ -422,35 +422,29 @@
     }
   }
 
-  // ===== AS5600 标定 (0/90/180/270 多点多点拟合) =====
+  // ===== AS5600 实时标定面板 UI =====
+  function formatPan(v) {
+    if (v === null || v === undefined) return '-';
+    // pan 0~360°: 360° 与 0° 同位置 (光电零位), 显示为 0°
+    let val = v;
+    if (val >= 359.95) val = 0.0;
+    return val.toFixed(2);
+  }
+
   function updateEncCalUi(d) {
-    const latest = d.latest || {};
+    const latest = d || {};
     const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
     set('encCalRaw', latest.raw ?? '-');
-    set('encCalCont', latest.cont_raw ?? '-');
-    set('encCalPan', (latest.pan !== null && latest.pan !== undefined) ? latest.pan.toFixed(2) : '-');
-    const ratio = d.ratio;
-    set('encCalRatio', ratio ? ratio.toFixed(3) + ':1' : '-');
-    set('encCalRpd', d.cal && d.cal.raw_per_deg ? d.cal.raw_per_deg.toFixed(3) : '-');
-    // 已记录点列表
-    const pts = d.points || [];
-    const box = $('encCalPoints');
-    if (box) {
-      if (!pts.length) {
-        box.innerHTML = '<div style="text-align:center;padding:6px 0;color:#64748b;">暂无记录点</div>';
-      } else {
-        box.innerHTML = pts.map(p => {
-          const cont = p.cont !== null && p.cont !== undefined ? p.cont : '-';
-          return `<div style="display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #1e293b;">
-            <span>${p.angle}° 点</span><span style="color:#7dd3fc;">cont=${cont}</span></div>`;
-        }).join('');
-      }
-    }
+    // angle: ESP32 回传原始累积角 (与控制组件下方 ang 一致), cont_angle 是除以 4 的物理连续角
+    set('encCalCont', latest.angle ?? '-');
+    set('encCalPan', formatPan(latest.pan));
+    set('encCalRpd', latest.zero_angle !== undefined && latest.zero_angle !== null
+      ? Number(latest.zero_angle).toFixed(2) + '°' : '-');
   }
 
   async function loadEncCal() {
     try {
-      const r = await fetch('/api/encoder/calibrate');
+      const r = await fetch('/api/encoder');
       const d = await r.json();
       if (d.ok) updateEncCalUi(d);
     } catch (e) { /* 忽略 */ }
@@ -458,103 +452,73 @@
 
   async function pollEncoderCal() {
     try {
-      const r = await fetch('/api/encoder/calibrate');
+      const r = await fetch('/api/encoder');
       const d = await r.json();
       if (d.ok) updateEncCalUi(d);
     } catch (e) { /* 忽略 */ }
-  }
-
-  async function encCalAction(action, angleDeg) {
-    try {
-      const r = await fetch('/api/encoder/calibrate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(action === 'add_point' ? { action, angle_deg: angleDeg } : { action })
-      });
-      const d = await r.json();
-      if (d.ok) {
-        if (action === 'set_origin') {
-          $('encCalResult').textContent = `0 点已设置 (cont_raw=${d.origin})，请转到 90° 记录`;
-          toast('0 点已设置');
-        } else if (action === 'add_point') {
-          $('encCalResult').textContent = `${d.angle}° 点已记录 (cont_raw=${d.cont})，共 ${d.count} 点`;
-          toast(`${d.angle}° 点已记录`);
-        } else {
-          $('encCalResult').textContent = `标定完成: ${d.raw_per_deg.toFixed(3)} raw/度, 传动比 ${d.ratio.toFixed(3)}:1`;
-          toast('标定完成');
-        }
-        updateEncCalUi(d);
-      } else {
-        toast((action === 'finish' ? '完成标定失败: ' : '') + (d.detail || '操作失败'));
-      }
-    } catch (e) { toast('操作失败: ' + e.message); }
   }
 
   $('encCalToggle').onclick = () => {
     $('encCalBody').classList.toggle('hidden');
     $('encCalToggle').classList.toggle('collapsed');
   };
-  $('btnEncSetOrigin').onclick = () => encCalAction('set_origin');
-  $('btnEncAdd90').onclick = () => encCalAction('add_point', 90);
-  $('btnEncAdd180').onclick = () => encCalAction('add_point', 180);
-  $('btnEncAdd270').onclick = () => encCalAction('add_point', 270);
-  $('btnEncFinish').onclick = () => encCalAction('finish');
-  $('btnEncCorrect').onclick = () => {
-    const a = parseFloat(($('encCorrAngle') || {}).value);
-    if (!a || a <= 0 || a >= 360) { toast('校正角度需在 0~360 之间'); return; }
-    encCalAction('add_point', a);
-  };
 
-  // ===== 自动转一圈标定 =====
-  async function pollAutoCalib() {
+  // ===== 光电自动校零 + 测速 =====
+  async function pollPhotoCalib() {
     try {
-      const r = await fetch('/api/encoder/autocalib');
+      const r = await fetch('/api/encoder/photocalib');
       const d = await r.json();
       if (!d.ok) return;
-      const st = $('encAutoStatus'), bConf = $('btnEncAutoConfirm');
+      const st = $('encPhotoStatus');
       if (!st) return;
-      if (d.status === 'turning') {
-        st.innerHTML = `⏳ 转动中… ${d.elapsed}s（约 1 分钟），请等待停止`;
-        bConf.style.display = 'none';
-      } else if (d.status === 'awaiting_confirm') {
-        st.innerHTML = '✋ 转动完成，请用方向键把云台调回物理 0°，然后点"已调回 0°，确认"';
-        bConf.style.display = '';
-      } else if (d.status === 'done') {
-        st.innerHTML = '✅ 自动标定完成，rpd 与水平速度已保存';
-        bConf.style.display = 'none';
+      const modeName = '自动校零';
+      if (d.running) {
+        const phase = d.phase === 'waiting_first' ? '等待光电触发起点…' :
+                      d.phase === 'waiting_second' ? '已触发起点，转一圈中，等待终点…' : '处理中…';
+        st.innerHTML = `⏳ 光电${modeName}中：${phase}`;
+      } else if (d.result && d.result.ok) {
+        const revs = d.result.as5600_revs;
+        const ratioTxt = (revs !== null && revs !== undefined) ? `${revs.toFixed(2)}:1` : '-';
+        st.innerHTML = `✅ 光电${modeName}完成：传动比 <b>${ratioTxt}</b>（AS5600 转角 <b>${d.result.angle_delta?.toFixed(1) ?? '-'}°</b>，0 基准角 <b>${d.result.zero_angle?.toFixed(1) ?? '-'}°</b>）` +
+          (d.result.pan_speed_dps ? `，水平速度已校准 <b>${d.result.pan_speed_dps.toFixed(3)}</b>°/s` : '') +
+          `（一圈耗时 ${d.result.elapsed}s）`;
+        loadEncCal();
+      } else if (d.result && !d.result.ok) {
+        st.innerHTML = `❌ ${d.result.detail || '光电' + modeName + '失败'}`;
       } else {
         st.innerHTML = '';
-        bConf.style.display = 'none';
       }
     } catch (e) { /* 忽略 */ }
   }
 
-  async function autoCalibAction(action) {
+  async function startPhotoCalib() {
+    if (!confirm('将让云台自动转一圈，利用光电传感器自动完成校零与测速，确定？')) return;
     try {
-      const r = await fetch('/api/encoder/autocalib', {
+      const r = await fetch('/api/encoder/photocalib', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action })
+        body: JSON.stringify({ action: 'start' })
       });
       const d = await r.json();
-      if (d.ok) {
-        if (action === 'start') {
-          toast('开始自动标定');
-        } else {
-          $('encCalResult').textContent =
-            `自动标定: ${d.raw_per_deg.toFixed(3)} raw/度, 传动比 ${d.ratio.toFixed(3)}:1` +
-            (d.pan_speed_dps ? `, 水平速度已校准 ${d.pan_speed_dps.toFixed(3)}°/s` : '');
-          toast('自动标定完成');
-          loadEncCal();
-        }
-      } else {
-        toast(d.detail || '操作失败');
-      }
-    } catch (e) { toast('操作失败: ' + e.message); }
+      if (d.ok) { toast(d.msg || '已开始'); pollPhotoCalib(); }
+      else toast(d.detail || '启动失败');
+    } catch (e) { toast('启动失败: ' + e.message); }
   }
 
-  $('btnEncAuto').onclick = () => autoCalibAction('start');
-  $('btnEncAutoConfirm').onclick = () => autoCalibAction('confirm');
+  async function manualSetZero() {
+    if (!confirm('将当前回传角度设为物理 0° 基准角 (zero_angle)，确定？')) return;
+    try {
+      const r = await fetch('/api/encoder/setzero', { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) { toast(d.msg || '已设置'); loadEncCal(); }
+      else toast(d.detail || '设置失败');
+    } catch (e) { toast('设置失败: ' + e.message); }
+  }
+
+  $('btnEncPhoto').onclick = () => startPhotoCalib();
+  $('btnEncSetZero').onclick = () => manualSetZero();
+
+  setInterval(pollPhotoCalib, 1000);
 
   // ===== 云台跟踪 =====
   $('btnTrack').onclick = async () => {
@@ -563,11 +527,17 @@
       try {
         const res = await fetch('/api/sat/track/' + currentNorad, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         const data = await res.json();
-        if (data.ok) {
+        if (data.ok && data.tracking) {
           tracking = true;
           $('btnTrack').textContent = '停止跟踪';
           $('btnTrack').classList.add('tracking');
           toast('开始跟踪 ' + currentNorad);
+        } else if (data.ok && data.detail) {
+          // 俯仰归零中: 后台正在开环把俯仰降到 0°, 完成后自动开始跟踪
+          tracking = true;
+          $('btnTrack').textContent = '停止跟踪';
+          $('btnTrack').classList.add('tracking');
+          toast(data.detail);
         } else toast('跟踪失败: ' + (data.detail || ''));
       } catch (e) { toast('跟踪失败'); }
     } else {
@@ -614,5 +584,4 @@
   restoreTracking();
   setInterval(loadFavorites, 30000);
   setInterval(pollEncoderCal, 500);
-  setInterval(pollAutoCalib, 500);
 })();

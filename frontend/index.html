@@ -23,7 +23,8 @@
   .topbar-right { display: flex; align-items: center; gap: 10px; }
   .topbar-item { display: flex; align-items: center; gap: 5px; color: #94a3b8; }
   .topbar-item .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; }
-  .dot.on { background: #22c55e; } .dot.off { background: #ef4444; }
+  .dot.on { background: #22c55e; } .dot.off { background: #ef4444; } .dot.warn { background: #f59e0b; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0.3; } }
   .topbar-user { color: #7dd3fc; font-weight: 600; }
   .topbar-btn {
     background: #334155; color: #e2e8f0; border: none;
@@ -361,32 +362,17 @@
         <div class="card-body" id="encCalBody">
           <div class="encoder-live" style="display:flex;justify-content:space-between;font-size:11px;color:#94a3b8;margin-bottom:10px;">
             <span>raw:<b id="encCalRaw">-</b></span>
-            <span>cont:<b id="encCalCont">-</b></span>
+            <span>angle:<b id="encCalCont">-</b></span>
             <span>pan:<b id="encCalPan">-</b>°</span>
-            <span>传动:<b id="encCalRatio">-</b></span>
           </div>
-          <div class="cal-title">标定流程 (0/90/180/270 四点多点拟合)</div>
-          <div id="encCalSteps" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px;">
-            <button class="btn-save" id="btnEncSetOrigin" style="background:#2563eb;margin:0;">① 设 0 点 <span style="font-weight:normal;font-size:11px;">(云台对准 0°，记录当前值)</span></button>
-            <button class="btn-save" id="btnEncAdd90" style="background:#d97706;margin:0;">② 转到 90° 记录 <span style="font-weight:normal;font-size:11px;">(方向键转到 90° 后点击)</span></button>
-            <button class="btn-save" id="btnEncAdd180" style="background:#d97706;margin:0;">③ 转到 180° 记录 <span style="font-weight:normal;font-size:11px;">(方向键转到 180° 后点击)</span></button>
-            <button class="btn-save" id="btnEncAdd270" style="background:#d97706;margin:0;">④ 转到 270° 记录 <span style="font-weight:normal;font-size:11px;">(方向键转到 270° 后点击)</span></button>
-            <button class="btn-save" id="btnEncFinish" style="background:#16a34a;margin:0;">完成标定 <span style="font-weight:normal;font-size:11px;">(四点点拟合 raw/度 并持久化)</span></button>
+          <div style="margin-bottom:8px;">
+            <button class="btn-save" id="btnEncPhoto" style="background:#ec4899;margin:0;width:100%;">📷 光电自动校零+测速 <span style="font-weight:normal;font-size:11px;">(云台自动转一圈，光电触发两次自动完成，无需手动对准)</span></button>
+            <button class="btn-save" id="btnEncSetZero" style="background:#db2777;margin:6px 0 0 0;width:100%;">📍 手动设置当前位置为 0° 基准 <span style="font-weight:normal;font-size:11px;">(将当前回传角度设为物理 0° 基准角)</span></button>
+            <div id="encPhotoStatus" style="font-size:11px;color:#94a3b8;margin-top:6px;"></div>
           </div>
-          <div id="encCalPoints" style="font-size:11px;color:#94a3b8;margin-bottom:10px;"></div>
-          <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px;border-top:1px solid #334155;padding-top:8px;">
-            <span style="font-size:11px;color:#94a3b8;">校正:</span>
-            <input id="encCorrAngle" type="number" value="180" min="0.5" max="359.5" step="0.5" style="width:70px;padding:5px;border-radius:6px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-size:12px;">
-            <button class="btn-save" id="btnEncCorrect" style="background:#7c3aed;margin:0;flex:1;">转到实际位置后点校正</button>
-          </div>
-          <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
-            <button class="btn-save" id="btnEncAuto" style="background:#0ea5e9;margin:0;flex:1;">⚙ 自动转一圈标定</button>
-            <button class="btn-save" id="btnEncAutoConfirm" style="background:#16a34a;margin:0;flex:1;display:none;">✔ 已调回 0°，确认</button>
-          </div>
-          <div id="encAutoStatus" style="font-size:11px;color:#94a3b8;margin-bottom:10px;"></div>
-          <div style="font-size:11px;color:#64748b;">当前已标定每度 raw 数: <b id="encCalRpd" style="color:#4ade80;">-</b></div>
+          <div style="font-size:11px;color:#64748b;">光电 0 基准角度 (ESP32 累积角): <b id="encCalRpd" style="color:#4ade80;">-</b></div>
           <div class="cal-result" id="encCalResult"></div>
-          <div style="font-size:11px;color:#64748b;margin-top:8px;">提示：① 用复位/方向键把云台对准 0° 后设 0 点；②③④ 依次转到各刻度并记录；完成后点"完成标定"自动拟合。验证偏了用"校正"：转到实际位置(如 180°)输入实际角度点校正，再点完成标定重新拟合。<br>⚠ 全程请同一方向（顺时针）转到位置，勿反向微调，避免齿轮回差。</div>
+          <div style="font-size:11px;color:#64748b;margin-top:8px;">提示：点击光电自动校零后, 云台会自动转一圈, 两次光电触发后自动完成校零与测速。<br>⚠ 全程请同一方向（顺时针）转到位置，勿反向微调，避免齿轮回差。</div>
         </div>
       </div>
 
@@ -590,18 +576,30 @@ document.querySelectorAll('.dpad button').forEach(btn => {
 });
 
 // ===== 复位 =====
+let _resetInProgress = false;   // 复位进行中标志; 由 /api/status 轮询到 resetting=false 时恢复按钮
 function setAllButtonsDisabled(disabled) {
   document.querySelectorAll('button').forEach(b => { b.disabled = disabled; });
 }
+function _resetDone() {
+  if (!_resetInProgress) return;
+  _resetInProgress = false;
+  setAllButtonsDisabled(false);
+  toast('复位完成');
+}
 $('btnHome').onclick = async () => {
-  if (confirm('确定复位到 0° 限位位置？')) {
+  if (confirm('确定复位？\n将找光电零位并停在物理 0°（pan=0）。')) {
     setAllButtonsDisabled(true);
+    _resetInProgress = true;
     try {
       const data = await api('/api/reset', {});
-      const total = data.duration || 20;
+      if (data.abort) {
+        _resetInProgress = false;
+        setAllButtonsDisabled(false);
+        toast('⚠ 无法复位：' + (data.detail || '已超限，回不去'));
+        return;
+      }
       toast('复位中，请稍候...');
-      setTimeout(() => { setAllButtonsDisabled(false); toast('复位成功'); }, total * 1000 + 500);
-    } catch (e) { setAllButtonsDisabled(false); }
+    } catch (e) { _resetInProgress = false; setAllButtonsDisabled(false); }
   }
 };
 
@@ -610,15 +608,14 @@ $('btnAntiTangle').onclick = async () => {
   try {
     const res = await fetch('/api/position');
     const data = await res.json();
-    const accum = data.pan_accum || 0;
+    const accum = (data.pan_accum || 0) / 4;   // ESP32域→物理角
     if (Math.abs(accum) < 1) { toast('累计偏移不足 1°，无需防缠绕复位'); return; }
-    if (!confirm('当前累计水平偏移 ' + accum + '°，将反向回退至零点，确定？')) return;
+    if (!confirm('当前累计水平偏移 ' + accum.toFixed(1) + '°，将反向回退至零点，确定？')) return;
     setAllButtonsDisabled(true);
+    _resetInProgress = true;
     const resp = await api('/api/anti_tangle_reset', {});
-    const total = resp.duration || 10;
-    toast('防缠绕复位中... 反向回退 ' + resp.accum + '°');
-    setTimeout(() => { setAllButtonsDisabled(false); toast('防缠绕复位完成'); }, total * 1000 + 500);
-  } catch (e) { setAllButtonsDisabled(false); toast('防缠绕复位失败'); }
+    toast('防缠绕复位中... 反向回退 ' + (resp.accum / 4).toFixed(0) + '°');
+  } catch (e) { _resetInProgress = false; setAllButtonsDisabled(false); toast('防缠绕复位失败'); }
 };
 
 // ===== 串口监控 =====
@@ -812,6 +809,8 @@ async function checkStatus() {
       // 更新顶部串口状态
       $('serialDot').className = 'dot on';
       $('serialText').textContent = `${data.port} @ ${data.baud}`;
+      // 复位完成 -> 恢复按钮控制 (不再依赖固定超时)
+      if (_resetInProgress && !data.resetting) _resetDone();
     } else {
       $('dot').className = 'dot off';
       $('statusText').textContent = '串口未连接: ' + (data.detail || '');
@@ -835,12 +834,13 @@ async function pollPosition() {
       $('panVal').innerHTML = data.pan + '<span class="unit">°</span>';
       $('tiltVal').innerHTML = data.tilt + '<span class="unit">°</span>';
       const pa = $('panAccum');
-      if (pa) pa.textContent = (data.pan_accum || 0) + '°';
+      if (pa) pa.textContent = ((data.pan_accum || 0) / 4).toFixed(0) + '°';  // ESP32域→物理角(4:1)
     }
   } catch (e) { /* 忽略 */ }
 }
 
 // ===== AS5600 编码器数值显示 =====
+let _tangleWarnShown = null;
 async function pollEncoder() {
   try {
     const res = await fetch('/api/encoder');
@@ -849,10 +849,21 @@ async function pollEncoder() {
       $('encoderBar').style.display = 'flex';
       $('encRaw').textContent = 'raw:' + (data.raw ?? '-');
       $('encAngle').textContent = 'ang:' + Number(data.angle).toFixed(1) + '°';
-      $('encPan').textContent = 'pan:' + Number(data.pan).toFixed(1) + '°';
-      // 更新顶部 UDP 状态 (有数据 = 在线)
-      $('udpDot').className = 'dot on';
-      $('udpText').textContent = 'ESP32 在线';
+      // pan 0~360°: 360° 与 0° 同位置 (光电零位), 显示为 0°
+      let panVal = Number(data.pan);
+      if (panVal >= 359.95) panVal = 0.0;
+      $('encPan').textContent = 'pan:' + panVal.toFixed(1) + '°';
+      // 防缠绕越界告警: 首次出现时 toast, 持续显示在顶部
+      const warn = data.tangle_warn;
+      if (warn) {
+        $('udpText').textContent = '⚠ ' + warn;
+        $('udpDot').className = 'dot warn';
+        if (_tangleWarnShown !== warn) { _tangleWarnShown = warn; toast('⚠ ' + warn + '，请及时复位归中'); }
+      } else {
+        _tangleWarnShown = null;
+        $('udpText').textContent = 'ESP32 在线';
+        $('udpDot').className = 'dot on';
+      }
     } else {
       $('udpDot').className = 'dot off';
       $('udpText').textContent = 'ESP32 离线';
@@ -870,7 +881,7 @@ setInterval(pollPosition, 500);
 setInterval(pollEncoder, 500);
 setInterval(pollSerialLog, 800);
 </script>
-<script src="satellite.js?v=20"></script>
+<script src="satellite.js?v=21"></script>
 <script>
 // ===== 登录状态管理器 =====
 (function () {

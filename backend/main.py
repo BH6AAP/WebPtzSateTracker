@@ -304,7 +304,8 @@ class PositionTracker:
         self.pan_accum = 0.0
 
     def _clamp(self):
-        self.pan = max(get_cfg("pan_min"), min(get_cfg("pan_max"), self.pan))
+        # 水平 0~360° 连续旋转 (360° 与 0° 同位置, 取模归一); 俯仰受物理限位
+        self.pan = self.pan % 360.0
         self.tilt = max(get_cfg("tilt_min"), min(get_cfg("tilt_max"), self.tilt))
 
     @staticmethod
@@ -370,19 +371,19 @@ class PositionTracker:
                 pan -= pan_delta
             if "right" in direction:
                 pan += pan_delta
-        pan = max(get_cfg("pan_min"), min(get_cfg("pan_max"), pan))
+        # 水平取模归一 0~360; 俯仰受物理限位
+        pan = pan % 360.0
         tilt = max(get_cfg("tilt_min"), min(get_cfg("tilt_max"), tilt))
         return pan, tilt
 
     def at_limit(self, direction: str) -> bool:
-        """判断某方向是否已达限位 (不结算运动)"""
+        """判断某方向是否已达限位 (不结算运动)
+        水平: 0°~360° 连续旋转, 360° 与 0° 同位置 (光电零位), 不设左右限位,
+              可顺时针/逆时针无限旋转 (仅俯仰有物理限位)。
+        """
         with self.lock:
             pan, tilt = self._estimate()
             eps = 0.01
-            if "left" in direction and pan <= get_cfg("pan_min") + eps:
-                return True
-            if "right" in direction and pan >= get_cfg("pan_max") - eps:
-                return True
             if "up" in direction and tilt >= get_cfg("tilt_max") - eps:
                 return True
             if "down" in direction and tilt <= get_cfg("tilt_min") + eps:
@@ -509,52 +510,238 @@ def _pan_delta(az: float, pan: float) -> float:
     return (az - pan + 180) % 360 - 180
 
 
-def _reset_loop(tilt_s: float):
-    """复位按钮: 水平轴按最短路径回 0° (AS5600 闭环), 俯仰轴按时长回 0°
-    防缠绕解缠由"防缠绕复位"按钮负责, 复位仅负责回 0 点。
-    每 100ms 读取实时反馈, 到位即停; 加超时兜底防止反馈失效时无限转动。
+# 复位找零参数: 低速 0x08(~1.9°/s)过冲小, 一圈约 189s; 超时兜底防光电失效无限转
+FIND_ZERO_SPEED = 0x08
+FIND_ZERO_TIMEOUT = 240.0
+
+# 超限回转参数: 堵转检测 (驱动一段时间回传角度无变化 => 线缆缠死/堵转)
+RECOVER_SPEED = 0x10          # 回转中速 (物理 ~3.8°/s)
+RECOVER_PROBE_S = 0.6         # 方向试探驱动时长 (秒)
+RECOVER_STALL_S = 2.5         # 连续驱动多少秒回传角无实质变化判定堵转
+RECOVER_STALL_TOL = 2.0       # 物理角: 该时长内角度变化小于此值视为堵转
+RECOVER_DEADLINE_S = 240.0    # 回转总超时 (物理 ±540°@3.8°/s 约 284s, 取此值兜底)
+RECOVER_TARGET_TOL = 10.0     # 回到 0° 多远算成功
+
+
+def _get_enc_offset():
+    """读取回传角度相对物理 0°(光电零位) 的偏移。
+    返回 ESP32 域偏移 = angle - zero_angle (未除 4, 与回传角度同量纲),
+    未标定或无数据返回 None。用最原始的 ESP32 累积角判断, 不依赖 cont_angle 换算。
     """
-    pan, _ = _sat_get_position()
-    daz0 = _pan_delta(0.0, pan)
-    pan_deadline = time.time() + max(30.0, abs(daz0) / get_cfg("pan_speed_dps") + 10)
+    with _encoder_lock:
+        angle = _encoder_state.get("angle")
+    zero = _encoder_cal.get("zero_angle")
+    if angle is None or zero is None:
+        return None
+    return float(angle) - zero
+
+
+def _probe_recover_direction():
+    """反馈试探回转方向: 向 left 驱动 RECOVER_PROBE_S, 比较偏移是否向 0 收敛。
+    该云台 left/right 实际转向可能与标准帧相反, 不硬编码方向, 以回传角度为准。
+    返回: 'left'/'right'/'stop' (无有效反馈时 stop, 不做试探)
+    """
+    off0 = _get_enc_offset()
+    if off0 is None:
+        print("[reset/probe] 无初始偏移, 放弃试探", flush=True)
+        return "stop"
+    try:
+        send(_MOVE_CMDS["left"](RECOVER_SPEED))
+        time.sleep(RECOVER_PROBE_S)
+        _stop_send()
+    except Exception as e:  # noqa: BLE001
+        _stop_send()
+        print(f"[reset/probe] 串口发送失败: {e}", flush=True)
+        return "stop"
+    off1 = _get_enc_offset()
+    if off1 is None:
+        print("[reset/probe] 试探后无偏移数据", flush=True)
+        return "stop"
+    print(f"[reset/probe] off0={off0:.0f} off1={off1:.0f} dOff={off1-off0:.0f}°ESP", flush=True)
+    if abs(off1) < abs(off0):
+        return "left"          # left 使偏移收敛
+    return "right"             # left 使偏移发散 -> 用 right
+
+
+def _recover_from_tangle():
+    """复位前处理超限: 基于回传角度 angle 与标定零位 zero_angle 的偏移
+    (ESP32 域 = angle - zero_angle) 判断是否越出防缠绕范围。
+    物理范围 [-540, 540] 对应 ESP32 域 [-2160, 2160] (×4)。
+    越界则试探出收敛方向后自动往 0° 回转; 用回传角度闭环判定堵转(回不去)立即停止。
+    返回: (ok, detail)
+      ok=True    已回到 0° 附近, 可继续找零
+      ok=False   堵转/超时回不去, 已停止并保持原位置
+    """
+    off = _get_enc_offset()
+    if off is None:
+        return True, "无编码器数据或未标定, 按范围内处理"
+    # ESP32 域范围: TANGLE_MIN/MAX 已是 ESP32 域 (物理 ±540° × 4)
+    if TANGLE_MIN <= off <= TANGLE_MAX:
+        return True, f"在范围内 (偏移 {off:.0f}°ESP)"
+    # 试探收敛方向 (不假设硬件方向)
+    direction = _probe_recover_direction()
+    if direction == "stop":
+        return False, "无编码器反馈, 无法判断回转方向"
+    print(f"[reset] 检测到超限 偏移={off:.0f}°ESP, 试探方向={direction}", flush=True)
     start = time.time()
-    pan_done = False
-    tilt_done = False
-    pan_dir = "left"
-    while not (pan_done and tilt_done):
-        if time.time() > pan_deadline:
-            pan_done = True
-        elapsed = time.time() - start
-        tilt_done = elapsed >= tilt_s
-        if not pan_done:
-            pan = _sat_get_position()[0]
-            daz = _pan_delta(0.0, pan)
-            if abs(daz) <= 0.5:
-                pan_done = True
-            else:
-                pan_dir = "left" if daz < 0 else "right"
-        if pan_done and tilt_done:
-            break
+    # 堵转检测状态 (用回传角度偏移, ESP32 域)
+    stall_last_t = time.time()
+    stall_last_off = _get_enc_offset()
+    # 回转闭环: 持续朝收敛方向转, 偏移回到目标容差内停止
+    # 目标容差换算: 物理 ±10° → ESP32 ±40°
+    target_tol = RECOVER_TARGET_TOL * ENCODER_GEAR
+    stall_tol = RECOVER_STALL_TOL * ENCODER_GEAR
+    while time.time() - start < RECOVER_DEADLINE_S:
+        cur = _get_enc_offset()
+        if cur is not None and abs(cur) <= target_tol:
+            print(f"[reset] 已回到 0° 附近 (偏移={cur:.0f}°ESP)", flush=True)
+            _stop_send()
+            return True, "已回到 0°"
+        # 堵转检测: 驱动期间偏移长时间不收敛 => 回不去
+        now = time.time()
+        if cur is not None and abs(cur - stall_last_off) < stall_tol \
+                and now - stall_last_t >= RECOVER_STALL_S:
+            print(f"[reset] 堵转检测: 电机在转但偏移不变 ({cur:.0f}°ESP), 判定回不去", flush=True)
+            _stop_send()
+            return False, "线缆缠死/堵转, 无法回转"
+        if cur is not None and abs(cur - stall_last_off) >= stall_tol:
+            stall_last_t = now
+            stall_last_off = cur
         try:
-            if not pan_done and not tilt_done:
-                send(pelco.up_left() if pan_dir == "left" else pelco.up_right())
-            elif not pan_done:
-                send(pelco.left() if pan_dir == "left" else pelco.right())
-            elif not tilt_done:
-                send(pelco.up())
+            send(_MOVE_CMDS[direction](RECOVER_SPEED))
         except Exception:  # noqa: BLE001
-            break
-        time.sleep(0.1)
+            _stop_send()
+            return False, "串口发送失败"
+        time.sleep(0.05)
+    _stop_send()
+    print(f"[reset] 回转超时, 仍未回到 0° (偏移={_get_enc_offset()}°ESP)", flush=True)
+    return False, "回转超时, 无法回到 0°"
+
+
+def _stop_send():
+    """发送停止帧 (复位/回转用)"""
     try:
         send(pelco.stop())
     except Exception:  # noqa: BLE001
         pass
+
+
+def _reset_loop(tilt_s: float):
+    """复位: 水平找光电 0° + 俯仰同时归零 (斜向同时运动)。
+    水平低速(0x08)找光电精确停 0°, 俯仰全速(0x20)按时长归零, 两轴同时驱动。
+    水平以光电触发为锚点精确停 0°, 俯仰按时长归零。
+    """
+    global _zero_evt_angle
+    _zero_evt.clear()
+    reset_start_t = time.time()   # 复位开始时间, 用于忽视复位前的旧光电事件
+    zero = _encoder_cal.get("zero_angle")
+    if zero is None:
+        try: send(pelco.stop())
+        except Exception: pass
+        print("[reset] 未标定 zero_angle, 无法复位", flush=True)
+        return
+    off = _get_enc_offset()
+    if off is None:
+        try: send(pelco.stop())
+        except Exception: pass
+        print("[reset] 无编码器数据, 无法复位", flush=True)
+        return
+
+    # 已在光电窗口: 当前角度接近标定基准 zero_angle 才免回转。
+    # 注意: 必须用标定基准 zero_angle 判断, 不能用 _zero_last_angle (最近一次触发),
+    # 否则手动转圈经过光电后停在别处也会被误判为"已在窗口", 导致电机不动。
+    with _encoder_lock:
+        cur_angle = _encoder_state.get("angle")
+    already_at_zero = (zero is not None
+            and cur_angle is not None
+            and abs(cur_angle - zero) < 10.0)
+
+    zero_angle_found = None   # 光电触发时的 ESP32 累积角度
+    horizontal_done = already_at_zero
+    direction = None
+
+    if already_at_zero:
+        zero_angle_found = zero
+        print(f"[reset] 已在标定 0° 附近 (angle={cur_angle:.1f}, zero={zero:.1f}), 免回转", flush=True)
+    else:
+        # 参照 zero_angle 试探回转方向
+        direction = _probe_recover_direction()
+        if direction == "stop":
+            try: send(pelco.stop())
+            except Exception: pass
+            print("[reset] 无编码器反馈, 无法判断回转方向", flush=True)
+            return
+        # 关键: 清掉试探期间可能产生的光电事件, 避免主循环捡到旧事件误停
+        _zero_evt.clear()
+        _zero_evt_angle = None
+        print(f"[reset] 水平回转方向={direction} 偏移={off:.0f}°ESP 目标=光电 0°", flush=True)
+
+    # ===== 合并复位: 水平找光电 + 俯仰同时归零 (斜向) =====
+    # 水平低速(0x08)找光电精确停; 俯仰全速(0x20)按时长归零
+    tilt_done = (tilt_s <= 0)
+    tilt_deadline = time.time() + tilt_s if tilt_s > 0 else None
+    find_deadline = time.time() + FIND_ZERO_TIMEOUT
+    _loop_cnt = 0
+
+    while time.time() < find_deadline:
+        # 光电触发 -> 水平完成 (只接受复位开始后的新事件, 忽视旧事件)
+        if _zero_evt.is_set():
+            if _zero_evt_t >= reset_start_t:
+                zero_angle_found = _zero_evt_angle
+                _zero_evt.clear()
+                horizontal_done = True
+                print(f"[reset] 水平已到光电 0° angle={zero_angle_found:.2f}", flush=True)
+            else:
+                # 旧事件 (复位前残留/试探期间延迟到达): 清掉继续转
+                _zero_evt.clear()
+                print(f"[reset] 忽视旧光电事件 angle={_zero_evt_angle} (t={_zero_evt_t-reset_start_t:.1f}s)", flush=True)
+
+        # 俯仰时长到 -> 俯仰完成
+        if not tilt_done and tilt_deadline is not None and time.time() >= tilt_deadline:
+            tilt_done = True
+            print(f"[reset] 俯仰时长到 ({tilt_s:.1f}s)", flush=True)
+
+        # 两轴都完成 -> 停止
+        if horizontal_done and tilt_done:
+            break
+
+        # 发送指令: 斜向(水平低速+俯仰全速) / 仅水平 / 仅俯仰
+        if not horizontal_done and not tilt_done:
+            if direction == "left":
+                cmd = pelco.up_left(FIND_ZERO_SPEED, 0x20)
+            else:
+                cmd = pelco.up_right(FIND_ZERO_SPEED, 0x20)
+        elif not horizontal_done:
+            cmd = _MOVE_CMDS[direction](FIND_ZERO_SPEED)
+        else:
+            cmd = pelco.up()   # 俯仰归零 (标准 UP 帧 = 低头, 与 _finalize 一致)
+        _loop_cnt += 1
+        if _loop_cnt % 20 == 1:  # 每 ~2s 打印一次角度
+            _cur_off = _get_enc_offset()
+            print(f"[reset] 驱动中 dir={direction} off={_cur_off:.0f}°ESP "
+                  f"t={time.time()-find_deadline+FIND_ZERO_TIMEOUT:.1f}s", flush=True)
+        try:
+            send(cmd)
+        except Exception:  # noqa: BLE001
+            break
+        time.sleep(0.1)
+    try: send(pelco.stop())
+    except Exception: pass
+
+    if zero_angle_found is not None:
+        print(f"[reset] 水平复位完成, 光电触发 angle={zero_angle_found:.2f} (zero_angle 保持不变)", flush=True)
+    else:
+        print("[reset] 水平复位超时未触发光电, 停转 (请检查光电传感器)", flush=True)
+
+    # 重置跟踪器位置
     with tracker.lock:
         tracker.pan = 0.0
         tracker.tilt = 0.0
         tracker._pan_base, tracker._tilt_base = 0.0, 0.0
-        tracker.pan_accum = 0.0  # 复位后清零累计 (重新开始记录)
-    _reanchor_zero()  # AS5600 以当前 raw 为新基准, 0 点对齐 (消除累计漂移)
+        tracker.pan_accum = 0.0
+    with _encoder_lock:
+        cont = _encoder_state.get("cont_angle")
+    print(f"[reset] 复位完成 cont={cont if cont is None else round(cont, 1)}°", flush=True)
 
 
 sat_tracker = satellite.SatelliteTracker(_sat_send_dir, _sat_get_position, _sat_set_position)
@@ -655,6 +842,7 @@ def status():
                    "paused": is_paused(),
                    "resetting": is_resetting(),
                    "udp_online": udp_online,
+                   "tangle_warn": _encoder_state.get("tangle_warn"),
                    "pan_speed_dps": get_cfg("pan_speed_dps"),
                    "tilt_speed_dps": get_cfg("tilt_speed_dps"),
                    "pan_range": [get_cfg("pan_min"), get_cfg("pan_max")],
@@ -736,20 +924,19 @@ def pulse():
     if sat_tracker.is_tracking():
         sat_tracker.stop()
     ms = max(50.0, min(2000.0, ms))
-    # 起始连续 pan (raw 域闭环实测, 未标定返回 None)
+    # 起始连续角度 (物理连续角, 已由 _process_encoder_data 换算, 无需再次减零位)
     with _encoder_lock:
-        start_cont = _encoder_state.get("cont_raw")
-    start_pan = _pan_cont_from_raw(start_cont) if start_cont is not None else None
+        start_cont = _encoder_state.get("cont_angle")
     # 按固定时长转动 (复用持续转动机制, 与其他控制互斥)
     start_hold(direction, check_limit=False)
     time.sleep(ms / 1000.0)
     stop_hold()
-    # 结束连续 pan, 计算有向增量 (右转正, 左转负)
+    # 结束连续角度, 计算有向增量 (右转正, 左转负)
     delta = None
     with _encoder_lock:
-        end_cont = _encoder_state.get("cont_raw")
-    if start_pan is not None and end_cont is not None:
-        d = _pan_cont_from_raw(end_cont) - start_pan
+        end_cont = _encoder_state.get("cont_angle")
+    if start_cont is not None and end_cont is not None:
+        d = end_cont - start_cont
         delta = round(d, 2)
     if delta is None and ("up" in direction or "down" in direction):
         speed = get_cfg("tilt_up_speed_dps" if "up" in direction else "tilt_down_speed_dps")
@@ -818,7 +1005,8 @@ def seriallog():
 def reset():
     if is_resetting():
         return err("复位正在进行中")
-    # 清理任务区命令队列: 停止持续转动、停止卫星跟踪、发送停止帧
+    # 清理任务区命令队列: 停止持续转动、停止卫星跟踪、取消俯仰归零、发送停止帧
+    _pre_track_stop.set()
     stop_hold()
     try:
         sat_tracker.stop()
@@ -831,13 +1019,18 @@ def reset():
     except Exception:  # noqa: BLE001
         pass
     set_resetting(True)
-    # 水平轴由 AS5600 闭环回 0° (无时间设置); 俯仰轴按时间复位回 0°
+    # 超限回转检测: 当前已越出防缠绕范围时, 先尝试自动回 0°; 回不去则立即提示, 不执行复位
+    rec_ok, rec_detail = _recover_from_tangle()
+    if not rec_ok:
+        set_resetting(False)
+        return ok({"detail": rec_detail, "abort": True})
+    # 水平轴由低速转圈 + 光电零位找 0 (无时间设置); 俯仰轴按时间复位回 0°
     with tracker.lock:
         tracker._finalize()
         cur_tilt = tracker.tilt
     tilt_s = max(0.1, (cur_tilt - get_cfg("tilt_min")) / get_cfg("tilt_speed_dps")) + 3
-    # 兜底: 取配置的俯仰复位时长与计算值较大者
-    tilt_s = max(tilt_s, get_cfg("reset_tilt_s"))
+    # 兜底: 取配置的俯仰复位时长与计算值较大者; 俯仰复位最长 17s (满行程 90°/5.18°s)
+    tilt_s = min(17.0, max(tilt_s, get_cfg("reset_tilt_s")))
 
     def _run():
         try:
@@ -847,7 +1040,12 @@ def reset():
         finally:
             set_resetting(False)
     threading.Thread(target=_run, daemon=True).start()
-    return ok({"detail": "复位指令已发送", "duration": round(tilt_s, 1)})
+    # 找零最多转一圈: 低速速率 = 全速 × 速度档位/0x20, 最坏时长 = 360°/低速速率
+    low_speed = get_cfg("pan_speed_dps") * FIND_ZERO_SPEED / 0x20
+    pan_s = 360.0 / low_speed if low_speed > 0 else FIND_ZERO_TIMEOUT
+    total_s = max(tilt_s, pan_s)
+    return ok({"detail": "复位指令已发送 (找光电零位后停在物理 0°)", "duration": round(total_s, 1),
+               "find_s": round(pan_s, 1), "recover": rec_detail})
 
 
 # ---------- 防缠绕复位 ----------
@@ -865,23 +1063,24 @@ def anti_tangle_reset():
         pass
     with tracker.lock:
         tracker._finalize()
-        accum = tracker.pan_accum
-    if abs(accum) < 1.0:
+        accum = tracker.pan_accum   # ESP32 域 (angle - zero_angle)
+    if abs(accum) < 4.0:   # 物理 < 1° 视为无需复位
         return ok({"detail": "无需防缠绕复位", "accum": 0, "duration": 0})
     direction = "left" if accum > 0 else "right"
     pan_speed = get_cfg("pan_speed_dps")
-    duration = abs(accum) / pan_speed + 1.0  # 估算时长 (仅用于前端按钮恢复)
+    accum_phys = abs(accum) / ENCODER_GEAR   # ESP32 域 -> 物理角
+    duration = accum_phys / pan_speed + 1.0  # 估算时长 (仅用于前端按钮恢复)
     set_resetting(True)
 
     def _run():
         try:
             # 用 AS5600 反馈闭环回退: 持续反向转动, 直到累计归零 (回到无缠绕起点)
             # 比时间估算精确, 且能正确处理多圈缠绕
-            timeout = time.time() + max(30.0, abs(accum) / pan_speed * 2 + 5)
+            timeout = time.time() + max(30.0, accum_phys / pan_speed * 2 + 5)
             while time.time() < timeout:
                 with tracker.lock:
                     remaining = tracker.pan_accum
-                if abs(remaining) < 1.0:
+                if abs(remaining) < 4.0:   # ESP32 域, 物理 < 1°
                     break
                 try:
                     send(_MOVE_CMDS[direction]())
@@ -898,7 +1097,7 @@ def anti_tangle_reset():
             with tracker.lock:
                 tracker._finalize()
                 tracker.pan_accum = 0.0  # 防缠绕复位后清零
-            _reanchor_zero()  # 回到 0° 起点, AS5600 基准对齐
+            # zero_angle 只由光电校准/手动设零设置, 防缠绕复位不改基准
             set_resetting(False)
 
     threading.Thread(target=_run, daemon=True).start()
@@ -1038,17 +1237,68 @@ def sat_track(norad: str):
     return ok({"points": points})
 
 
+# 俯仰轴无编码器反馈, 开启跟踪前若俯仰不在 0°, 需先开环按时间降到 0°
+# (仰角位置不可信, 归零是唯一可校准的起点), 完成后才启动跟踪线程
+_pre_track_stop = threading.Event()   # 置位 = 取消进行中的归零
+_pre_track_busy = False                # 归零线程是否在跑
+_pre_track_lock = threading.Lock()
+
+
 @app.route("/api/sat/track/<norad>", methods=["POST"])
 def sat_track_start(norad: str):
+    global _pre_track_busy
     satellite.fetch_tle()
     if satellite.get_tle(norad) is None:
         return err("卫星不存在或无 TLE 数据", 404)
-    sat_tracker.start(norad)
-    return ok({"tracking": True, "norad": norad})
+    with _pre_track_lock:
+        if _pre_track_busy:
+            return err("俯仰归零中, 请稍候")
+        _pre_track_busy = True
+    _pre_track_stop.clear()
+    with tracker.lock:
+        tracker._finalize()
+        cur_tilt = tracker.tilt
+    if cur_tilt <= 0.5:
+        # 俯仰已在 0° 附近, 直接开始跟踪
+        with _pre_track_lock:
+            _pre_track_busy = False
+        sat_tracker.start(norad)
+        return ok({"tracking": True, "norad": norad})
+    # 俯仰开环归零: 按当前推算 tilt 时长降到 0° (最长 90°/5.18°s ≈ 17s)
+    tilt_s = min(max(1.0, cur_tilt / get_cfg("tilt_down_speed_dps") + 1.0), 20.0)
+
+    def _run():
+        try:
+            tracker.start_move("down")
+            end = time.time() + tilt_s
+            while time.time() < end and not _pre_track_stop.is_set():
+                try:
+                    send(_MOVE_CMDS["down"]())   # down=低头 (该云台 pelco.up 即低头)
+                except Exception:  # noqa: BLE001
+                    break
+                time.sleep(0.1)
+        finally:
+            try:
+                send(pelco.stop())
+            except Exception:  # noqa: BLE001
+                pass
+            with tracker.lock:
+                tracker._finalize()
+                tracker.tilt = 0.0      # 已按时长归零, 俯仰位置对齐 0°
+                tracker._tilt_base = 0.0
+            if not _pre_track_stop.is_set():
+                sat_tracker.start(norad)
+            with _pre_track_lock:
+                _pre_track_busy = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return ok({"tracking": False, "norad": norad,
+               "detail": f"俯仰归零中 {tilt_s:.0f}s"})
 
 
 @app.route("/api/sat/track/stop", methods=["POST"])
 def sat_track_stop():
+    _pre_track_stop.set()   # 取消进行中的俯仰归零
     sat_tracker.stop()
     _sat_send_dir("stop")
     return ok({"tracking": False})
@@ -1100,135 +1350,107 @@ def sat_favorites_del(norad: str):
 
 
 # ---------- AS5600 磁编码器回传(水平轴位置校正) ----------
-_encoder_state = {"time": 0.0, "angle": None, "raw": None, "pan": None, "cont_raw": None}
+_encoder_state = {"time": 0.0, "angle": None, "raw": None, "pan": None, "cont_angle": None,
+                  "tangle_warn": None}  # tangle_warn: 防缠绕越界告警文本
 _encoder_lock = threading.Lock()
 
 ENCODER_CAL_FILE = os.path.join(BASE_DIR, "encoder_cal.json")
 
+# 标定: zero_angle = 光电 0° 对应的 ESP32 累积角度(持久化, 由光电校零/复位写入)
+# pan = (angle - zero_angle) % 360, 直接使用 ESP32 多圈 unwrap 角度, 与 raw 无关
+_encoder_cal = {"zero_angle": None}
 
-class As5600Raw:
-    """AS5600 原始计数(0~4095)多圈跟踪器
-    全部在 raw 整数域计算, 避免角度浮点累计误差。
-    - cont_raw = 圈数*4096 + raw, 跨 4095/0 线自动 ±4096
-    - deadzone: 静止死区, 小于该值增量视为抖动不累计 (防随机游走漂移)
-    - 动态死区: 运动期间(moving=True)死区降至 1 raw, 低速/短脉冲/滑行尾段不丢失;
-      静止时保持 15 raw 滤除传感器抖动
-      (实测死区 2 时 100Hz 下每帧运动增量仅 3.5 raw, 滑行尾段(<4.3°/s)被吞,
-       每次脉冲少记 ~0.5°, 跟踪中反复补差累积超前, 复位也回不到 0°; 死区 1
-       滑行衰减快几乎不吞, 10 次脉冲累计误差从 -1.2° 降至 -0.2°)
-    """
-    RAW_PER_REV = 4096
-
-    def __init__(self, deadzone: int = 15):
-        self.cont_raw = None
-        self._last_raw = None
-        self._deadzone = deadzone
-
-    def update(self, raw: int, moving: bool = False) -> int:
-        raw = int(raw) & 0x0FFF
-        if self._last_raw is None:
-            self.cont_raw = raw
-        else:
-            d = raw - self._last_raw
-            if d > 2048:
-                d -= self.RAW_PER_REV
-            elif d < -2048:
-                d += self.RAW_PER_REV
-            dz = 1 if moving else self._deadzone
-            if abs(d) < dz:
-                d = 0
-            self.cont_raw += d
-        self._last_raw = raw
-        return self.cont_raw
-
-    def reset(self):
-        """重置多圈基准: 下一次 update 以当前 raw 重新开始计数"""
-        self.cont_raw = None
-        self._last_raw = None
+# ---------- 防缠绕角度范围 (ESP32 域) ----------
+# 防缠绕累计角直接基于 ESP32 回传角度: off = angle - zero_angle (物理0°映射的 ESP32 记录角)。
+# 4:1 减速下 物理 1° = ESP32 4°, 允许左右各 1.5 圈(物理 ±540°) = ESP32 域 ±2160°。
+# 与 _recover_from_tangle 超限回转判定同域, 不再除 4。
+TANGLE_MIN = -2160.0
+TANGLE_MAX = 2160.0
 
 
-_as5600 = As5600Raw()
-
-# raw 标定: raw_per_deg 每度raw数(持久化, 物理传动属性); origin 零点 cont_raw(内存)
-# 旧格式 points 仅作角度兜底, 不再用于新计算
-_encoder_cal = {"raw_per_deg": None}
-_cal_origin = None      # 0 点对应的 cont_raw (设0点/复位时更新)
-_cal_points = []        # 多点标定记录: [{"angle": 90, "cont": ...}, ...] (内存)
+def _tangle_warn(off):
+    """判定 ESP32 域累计偏移 (angle - zero_angle) 是否越出防缠绕范围, 返回告警文本 (None=正常)"""
+    if off is None:
+        return None
+    if off < TANGLE_MIN:
+        return f"防缠绕越界: 累计偏移 {off:.0f}°ESP < 下限 {TANGLE_MIN:.0f}°ESP (物理 {off/ENCODER_GEAR:.0f}°)"
+    if off > TANGLE_MAX:
+        return f"防缠绕越界: 累计偏移 {off:.0f}°ESP > 上限 {TANGLE_MAX:.0f}°ESP (物理 {off/ENCODER_GEAR:.0f}°)"
+    return None
 
 
 def _load_encoder_cal():
-    global _encoder_cal, _cal_origin
-    _encoder_cal = {"raw_per_deg": None}
-    _cal_origin = None
+    global _encoder_cal
+    _encoder_cal = {"zero_angle": None}
     try:
         if os.path.exists(ENCODER_CAL_FILE):
             with open(ENCODER_CAL_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
                 if isinstance(d, dict):
-                    if d.get("raw_per_deg"):
-                        _encoder_cal["raw_per_deg"] = float(d["raw_per_deg"])
-                    if d.get("origin") is not None:
-                        _cal_origin = int(d["origin"])
+                    if d.get("zero_angle") is not None:
+                        _encoder_cal["zero_angle"] = float(d["zero_angle"])
     except Exception:  # noqa: BLE001
-        _encoder_cal = {"raw_per_deg": None}
-        _cal_origin = None
+        _encoder_cal = {"zero_angle": None}
 
 
 def _save_encoder_cal():
     try:
-        data = dict(_encoder_cal)
-        data["origin"] = _cal_origin
         with open(ENCODER_CAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(_encoder_cal, f, ensure_ascii=False, indent=2)
     except Exception as e:  # noqa: BLE001
         print(f"[encoder_cal] save error: {e!r}", flush=True)
 
 
-def _pan_from_cont_raw(cont_raw):
-    """连续 raw -> 云台 pan (0~360°), 未标定返回 None"""
-    rpd = _encoder_cal.get("raw_per_deg")
-    if not rpd or _cal_origin is None or cont_raw is None:
-        return None
-    return ((cont_raw - _cal_origin) / rpd) % 360.0
+# 云台输出轴 1 圈 = AS5600 4 圈 (4:1 减速): ESP32 累积角 = 物理角 × 4。
+# 后端统一换算为物理角, 故下面映射均除以 4。
+ENCODER_GEAR = 4.0
 
 
-def _pan_cont_from_raw(cont_raw):
-    """连续 raw -> 连续 pan (不取模, 防缠绕累计用), 未标定返回 None"""
-    rpd = _encoder_cal.get("raw_per_deg")
-    if not rpd or _cal_origin is None or cont_raw is None:
-        return None
-    return (cont_raw - _cal_origin) / rpd
-
-
-def _reanchor_zero():
-    """云台物理回到 0° 后调用: 以当前 raw 为新基准重新计数并对齐 0 点
-    消除复位/标定过程中 AS5600 多圈累计的漂移。
+def _pan_from_angle(angle):
+    """ESP32 累积角度 -> 云台 pan (0~360°, 物理角), 未标定返回 None。
+    360° 与 0° 同位置 = 光电零位。顺时针递增, 逆时针从 360 递减 (不用负值)。
     """
-    global _cal_origin, _last_pan_cont
-    with _encoder_lock:
-        raw = _encoder_state.get("raw")
-    _as5600.reset()
-    _cal_origin = raw
+    zero = _encoder_cal.get("zero_angle")
+    if zero is None or angle is None:
+        return None
+    return ((float(angle) - zero) / ENCODER_GEAR) % 360.0
+
+
+def _pan_cont_from_angle(angle):
+    """ESP32 累积角度 -> 连续物理 pan (不取模, 防缠绕累计用), 未标定返回 None"""
+    zero = _encoder_cal.get("zero_angle")
+    if zero is None or angle is None:
+        return None
+    return (float(angle) - zero) / ENCODER_GEAR
+
+
+def _reanchor_zero(angle=None):
+    """云台物理回到 0° 后调用: 以当前 ESP32 累积角度为新基准对齐 0 点
+    消除复位/标定过程中 AS5600 累计漂移。angle=None 时取最新上报值。
+    """
+    global _last_pan_cont
+    if angle is None:
+        with _encoder_lock:
+            angle = _encoder_state.get("angle")
+    if angle is None:
+        return
+    _encoder_cal["zero_angle"] = float(angle)
     _last_pan_cont = None
     _save_encoder_cal()  # 复位后 0 点变化, 持久化防重启丢失
+    print(f"[encoder] 零点锚定 angle={angle:.2f} (光电零位/复位)", flush=True)
 
 
-# 上一次连续 pan (raw 域), 用于增量累计防缠绕
+# 光电零位事件 (复位找零时由 UDP 线程置位, _reset_loop 消费)
+_zero_evt = threading.Event()
+_zero_evt_angle = None
+_zero_evt_t = 0.0          # 光电事件到达服务器的时间戳 (用于复位时忽视旧事件)
+# 最近一次光电零位触发 (ESP32 累积角度域): 用于判断挡片是否仍停在窗口内
+_zero_last_angle = None
+_zero_last_t = 0.0
+
+
+# 上一次回传角度偏移 (ESP32 域), 用于增量累计防缠绕
 _last_pan_cont = None
-# 最近一次云台运动结束时刻, 用于停驶惯性滑行段保持运动死区 (吞掉滑行量会累积超前)
-_enc_motion_end = 0.0
-
-
-def _hold_moving() -> bool:
-    """持续转动/点动脉冲/自动标定转动是否进行中 (UDP 线程只读, GIL 下安全)
-    自动标定转动是直发指令, 不经 start_hold, 需单独纳入运动判定,
-    否则静止死区会吞掉 100Hz 下每帧 3.5 raw 的增量, 导致 cont_raw 不累计"""
-    if tracker._moving is not None:
-        return True
-    try:
-        return _auto_calib["phase"] == "turning"
-    except NameError:
-        return False
 
 
 _load_encoder_cal()
@@ -1236,56 +1458,54 @@ _load_encoder_cal()
 
 def _process_encoder_data(angle, raw):
     """处理 AS5600 编码器数据, 更新水平轴位置 (HTTP POST 和 UDP 共用)
-    raw 域: _as5600 多圈展开 -> 连续 raw -> 标定映射 pan / 连续 pan (防缠绕增量)
-    angle 仅作兜底 (固件 unwrap 连续角度, 未标定或 raw 缺失时用)。
+    直接使用 ESP32 固件 unwrap 累积角度 (多圈展开), 计算 pan = (angle - zero) % 360。
+    raw 仅作诊断显示, 不参与计算 (raw 是 0~4096 循环的单圈值)。
     """
-    global _last_pan_cont, _enc_motion_end
+    global _last_pan_cont
     now = time.time()
     pan = None
-    cont_raw = None
-    # 动态死区: 云台运动期间死区降至 2 raw (低速/短脉冲运动不丢失)
-    moving = (sat_tracker.is_tracking()
-              or is_resetting()
-              or _hold_moving())
-    if moving:
-        _enc_motion_end = now
-    else:
-        # 停止后 1s 内仍用运动死区: 电机断电后惯性滑行段增量渐减,
-        # 若立即切回静止死区 15 raw 会吞掉尾段滑行量, 导致每次步进
-        # AS5600 显示比物理少 0.4~1°, 跟踪中反复补差形成累积超前
-        moving = (now - _enc_motion_end) < 1.0
-    if raw is not None:
-        try:
-            cont_raw = _as5600.update(raw, moving=moving)
-            pan = _pan_from_cont_raw(cont_raw)
-        except (ValueError, TypeError):
-            pass
-    if pan is None and angle is not None:
+    cont_angle = None
+    # 固件 unwrap 已处理角度差分 (±180° 截断, 天然抗抖动), 后端直接透传累积角度。
+    if angle is not None:
         try:
             angle = float(angle)
-            # 未标定或 raw 缺失时, 直接透传固件角度 (不折叠, 与旧行为一致)
-            pan = float(angle) % 360.0
+            pan = _pan_from_angle(angle)
+            cont_angle = _pan_cont_from_angle(angle)
         except (ValueError, TypeError):
             pass
     if pan is None:
+        # 未标定 (zero_angle=None) 时 pan/cont_angle 无意义, 但 angle/raw 仍需上报
+        with _encoder_lock:
+            _encoder_state["time"] = now
+            _encoder_state["angle"] = angle
+            _encoder_state["raw"] = raw
+            _encoder_state["cont_angle"] = None
+            _encoder_state["pan"] = None
+            _encoder_state["tangle_warn"] = None
         return
-    # 防缠绕累计: raw 域连续 pan 增量 (跨 4096/0 线已由多圈展开处理, 无跳变)
-    if cont_raw is not None:
-        cont_pan = _pan_cont_from_raw(cont_raw)
-        if cont_pan is not None:
-            if _last_pan_cont is not None:
-                delta = cont_pan - _last_pan_cont
-                # 异常跳变(复位/标定瞬间) 视为 0, 不污染累计
-                if abs(delta) <= 180.0:
-                    with tracker.lock:
-                        tracker.pan_accum += delta
-            _last_pan_cont = cont_pan
+    # 防缠绕累计: 直接用 ESP32 域偏移 off = angle - zero_angle 增量 (与超限回转同域)
+    zero = _encoder_cal.get("zero_angle")
+    off = (float(angle) - zero) if zero is not None else None
+    if off is not None:
+        if _last_pan_cont is not None:
+            delta = off - _last_pan_cont
+            # 异常跳变(复位/标定瞬间) 视为 0, 不污染累计 (ESP32 域 ±180° = 物理 ±45°)
+            if abs(delta) <= 180.0:
+                with tracker.lock:
+                    tracker.pan_accum += delta
+        _last_pan_cont = off
     with _encoder_lock:
         _encoder_state["time"] = now
         _encoder_state["angle"] = angle
         _encoder_state["raw"] = raw
-        _encoder_state["cont_raw"] = cont_raw
+        _encoder_state["cont_angle"] = cont_angle
         _encoder_state["pan"] = pan
+        # 防缠绕越界判定: 越界即告警, 提示需复位归中 (ESP32 域 off)
+        warn = _tangle_warn(off)
+        if warn != _encoder_state.get("tangle_warn"):
+            if warn:
+                print(f"[tangle] {warn}", flush=True)
+            _encoder_state["tangle_warn"] = warn
     with tracker.lock:
         if tracker._moving is not None:
             direction, start = tracker._moving
@@ -1303,9 +1523,48 @@ def _process_encoder_data(angle, raw):
         tracker.pan = pan
 
 
-# ---------- UDP 监听 (AS5600 编码器数据) ----------
+# ---------- UDP 监听 (AS5600 编码器数据 + 光电零位事件) ----------
+def _handle_encoder_payload(payload: dict):
+    """统一处理 ESP32 上报: 编码数据 / 光电零位事件"""
+    if payload.get("event") == "zero":
+        global _zero_evt_angle, _zero_last_angle, _zero_last_t
+        angle = payload.get("angle")
+        # 记录最近一次零位触发, 供复位判断挡片是否已停在窗口内
+        if angle is not None:
+            _zero_last_angle = float(angle)
+            _zero_last_t = time.time()
+        if _photo_calib["running"]:
+            # 光电自动校零: 采样触发点 (起点 0° / 一圈后终点)
+            # 直接使用 ESP32 zero 报文自带的累积角度 (与触发时刻严格同步, 无时间差)
+            angle_val = payload.get("angle")
+            if angle_val is None:
+                with _encoder_lock:
+                    angle_val = _encoder_state.get("angle")
+            print(f"[photo_calib] 收到zero angle={angle_val} phase={_photo_calib['phase']}", flush=True)
+            _photo_calib_on_trigger(angle_val)
+            return
+        if is_resetting():
+            # 复位找零: 置事件供 _reset_loop 消费 (以触发瞬间 angle 精确锚定 0 点)
+            global _zero_evt_t
+            _zero_evt_angle = payload.get("angle")
+            if _zero_evt_angle is None:
+                with _encoder_lock:
+                    _zero_evt_angle = _encoder_state.get("angle")
+            _zero_evt_t = time.time()   # 记录事件到达时间, 供复位忽视旧事件
+            _zero_evt.set()
+            return
+        if sat_tracker.is_tracking():
+            # 跟踪中经过光电零位: 仅记录, 不改基准 (zero_angle 只由校准/手动设零设置)
+            print(f"[encoder] 跟踪中经过光电零位 angle={payload.get('angle')}", flush=True)
+            return
+        # 手动/空闲状态经过光电零位: 不锚定 0 点。
+        # 绝对 0°(360°) 由标定时的 zero_angle 固定, 手动转动不应重设基准。
+        return
+    _process_encoder_data(payload.get("angle"), payload.get("raw"))
+
+
 def _udp_encoder_listener():
-    """监听 UDP 广播, 接收 ESP32 AS5600 编码器数据"""
+    """监听 UDP 广播, 接收 ESP32 AS5600 编码器数据与零位事件"""
     import socket as _socket
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
@@ -1315,9 +1574,9 @@ def _udp_encoder_listener():
         try:
             data, addr = sock.recvfrom(1024)
             payload = json.loads(data.decode("utf-8"))
-            _process_encoder_data(payload.get("angle"), payload.get("raw"))
-        except Exception:  # noqa: BLE001
-            pass
+            _handle_encoder_payload(payload)
+        except Exception as e:  # noqa: BLE001
+            print(f"[udp] handler error: {e!r}", flush=True)
 
 
 threading.Thread(target=_udp_encoder_listener, daemon=True).start()
@@ -1325,221 +1584,166 @@ threading.Thread(target=_udp_encoder_listener, daemon=True).start()
 
 @app.route("/api/encoder", methods=["POST"])
 def encoder_post():
-    """接收 AS5600 磁编码器数据 (HTTP POST 兼容保留, UDP 为主)"""
+    """接收 AS5600 磁编码器数据 / 光电零位事件 (HTTP POST 兼容保留, UDP 为主)"""
     data = request.get_json(silent=True) or {}
+    _handle_encoder_payload(data)
+    if data.get("event") == "zero":
+        return ok({"event": "zero", "zero_angle": _encoder_cal.get("zero_angle")})
     raw = data.get("raw")
     angle = data.get("angle")
     if raw is None and angle is None:
         return err("缺少 raw 或 angle")
-    _process_encoder_data(angle, raw)
     with _encoder_lock:
         st = dict(_encoder_state)
     return ok({"raw": raw, "angle": angle,
-               "pan": st.get("pan"), "cont_raw": st.get("cont_raw")})
+               "pan": st.get("pan"), "cont_angle": st.get("cont_angle")})
 
 
 @app.route("/api/encoder", methods=["GET"])
 def encoder_get():
     with _encoder_lock:
-        return ok(dict(_encoder_state))
+        st = dict(_encoder_state)
+    st["zero_angle"] = _encoder_cal.get("zero_angle")
+    return ok(st)
 
 
-@app.route("/api/encoder/calibrate", methods=["GET", "POST"])
-def encoder_calibrate():
-    """AS5600 raw 域多点标定:
-    1. set_origin : 云台对准 0°, 记录当前 cont_raw 为 0 点
-    2. add_point  : 转到 90°/180°/270° 等刻度, 逐个记录 {angle, cont_raw}
-    3. finish     : 用全部标定点对原点最小二乘拟合 raw_per_deg (消除单点误差)
-    完成后 raw_per_deg 持久化, 后期计算全在 raw 整数域进行。
-    """
-    global _cal_origin, _cal_points, _last_pan_cont
-    if request.method == "GET":
-        with _encoder_lock:
-            latest = dict(_encoder_state)
-        rpd = _encoder_cal.get("raw_per_deg")
-        return ok({"cal": _encoder_cal, "latest": latest,
-                   "origin": _cal_origin, "points": list(_cal_points),
-                   "ratio": (rpd / 4096.0) if rpd else None,
-                   "pan": _pan_from_cont_raw(latest.get("cont_raw")),
-                   "pan_cont": _pan_cont_from_raw(latest.get("cont_raw"))})
 
-    data = request.get_json(silent=True) or {}
-    action = data.get("action")
-    if action not in ("set_origin", "add_point", "finish"):
-        return err("action 需为 set_origin / add_point / finish")
-
-    def _cur_cont_raw():
-        with _encoder_lock:
-            return _encoder_state.get("cont_raw")
-
-    if action == "set_origin":
-        cont = _cur_cont_raw()
-        if cont is None:
-            return err("尚未收到 AS5600 raw 数据, 请先确认 UDP 数据流")
-        _cal_origin = cont
-        _cal_points = []
-        _save_encoder_cal()  # origin 持久化, 重启服务不丢标定
-        with tracker.lock:
-            tracker._finalize()
-            tracker.pan_accum = 0.0
-        _last_pan_cont = None
-        return ok({"origin": _cal_origin, "pan": _pan_from_cont_raw(cont)})
-
-    if action == "add_point":
-        if _cal_origin is None:
-            return err("请先设 0 点 (set_origin)")
-        cont = _cur_cont_raw()
-        if cont is None:
-            return err("尚未收到 AS5600 raw 数据, 请先确认 UDP 数据流")
-        try:
-            angle_deg = float(data.get("angle_deg"))
-        except (ValueError, TypeError):
-            return err("angle_deg 格式错误")
-        if not (0 < angle_deg < 360):
-            return err("angle_deg 需在 (0, 360) 之间")
-        # 同角度覆盖旧点 (允许重复记录覆盖)
-        _cal_points = [p for p in _cal_points if abs(p["angle"] - angle_deg) > 0.5]
-        _cal_points.append({"angle": angle_deg, "cont": cont})
-        _cal_points.sort(key=lambda p: p["angle"])
-        return ok({"points": list(_cal_points),
-                   "count": len(_cal_points),
-                   "angle": angle_deg, "cont": cont})
-
-    # finish: 0 点锁定为用户设 0 点时的物理位置(_cal_origin), 绝不重拟合!
-    # 各标定点(90/180/270...)仅用于过原点最小二乘求 rpd(斜率),
-    # 多点平均掉各点手动对准误差; 若重拟合截距作 0 点, 各点对准误差会
-    # 污染 0 点, 导致复位回到"拟合 0°"而非用户物理 0°, 偏离数度
-    if _cal_origin is None:
-        return err("请先设 0 点 (set_origin)")
-    if len(_cal_points) < 1:
-        return err(f"标定点不足 ({len(_cal_points)}/1), 请至少记录 1 个点")
-    pts = [(float(p["angle"]), float(p["cont"]) - float(_cal_origin)) for p in _cal_points]
-    sxy = sum(a * c for a, c in pts)
-    sxx = sum(a * a for a, c in pts)
-    if abs(sxx) < 1e-9:
-        return err("标定点数据无效 (请确保角度各不相同)")
-    rpd = sxy / sxx
-    _encoder_cal["raw_per_deg"] = rpd
-    _save_encoder_cal()
-    with tracker.lock:
-        tracker._finalize()
-        tracker.pan_accum = 0.0
-    _last_pan_cont = None
-    # 各点残差 (用于前端展示标定质量)
-    residuals = [round(p["cont"] - _cal_origin - rpd * p["angle"], 1) for p in _cal_points]
-    return ok({"cal": _encoder_cal, "origin": _cal_origin,
-               "points": list(_cal_points),
-               "raw_per_deg": rpd, "ratio": rpd / 4096.0,
-               "residuals": residuals,
-               "pan": _pan_from_cont_raw(_cur_cont_raw())})
-
-
-# ---------- 自动转一圈标定 (起终点物理 0° 锚定, 消除人工对准误差) ----------
-_auto_calib_lock = threading.Lock()
-_auto_calib = {
-    "running": False,   # 后台转动线程是否在跑
-    "phase": "idle",    # idle / turning / awaiting_confirm / done
-    "t0": 0.0,          # 转动开始时刻
-    "c0": None,         # 起点 cont_raw (设 0 点后)
-    "samples": [],      # [(elapsed, cont_raw)] 转动采样
-    "stop_cmd": None,   # 后台线程停止 Event
+# ---------- 光电自动校零 + 测速 (零位由光电传感器自动锚定, 全程无需手动对准) ----------
+# 原理: 云台全速右转, 利用光电挡片触发两次(起点 0° + 转过一圈再回 0°)。
+# 直接使用 ESP32 累积角度: 两次触发间的累积角度增量 = 输出轴一圈对应的 AS5600 转角,
+# 得传动比 (AS5600 圈数/输出轴1圈); 由 360/一圈耗时 得实际水平速度。
+# 触发瞬间角度由 ESP32 读取, 不受转动速度/过冲影响, 起终点均精确锚定 0°。
+_photo_calib_lock = threading.Lock()
+_photo_calib = {
+    "running": False,   # 是否在光电校零/测速中
+    "mode": "auto",     # auto(后端控制转圈) / logonly(只记录不控制)
+    "phase": "idle",    # idle / waiting_first / waiting_second / done
+    "start_angle": None,  # 第一次触发 ESP32 累积角度 (起点 0°)
+    "end_angle": None,    # 第二次触发 ESP32 累积角度
+    "t0": 0.0,          # 第一次触发时刻
+    "t1": 0.0,          # 第二次触发时刻
+    "stop_cmd": None,   # 后台转动线程停止 Event
 }
 
 
-def _read_cont_raw():
-    with _encoder_lock:
-        return _encoder_state.get("cont_raw")
+def _photo_calib_on_trigger(angle_val):
+    """光电校零期间, zero 事件到达时采样触发点 (由 _handle_encoder_payload 调用)
+    直接使用 ESP32 累积角度 (unwrap 多圈度数) 计算, 抗丢包/卡死
+    """
+    with _photo_calib_lock:
+        if not _photo_calib["running"]:
+            return
+        now = time.time()
+        ph = _photo_calib["phase"]
+        if ph == "waiting_first":
+            # 第一次触发: 起点 0°
+            _photo_calib["start_angle"] = angle_val
+            _photo_calib["t0"] = now
+            _photo_calib["phase"] = "waiting_second"
+            print(f"[photo_calib] 起点触发 angle={angle_val}", flush=True)
+        elif ph == "waiting_second":
+            # 第二次触发: 用时间间隔(>3s)判断
+            elapsed = now - _photo_calib["t0"]
+            print(f"[photo_calib] 二次触发 angle={angle_val} elapsed={elapsed:.1f}s", flush=True)
+            if elapsed >= 3.0:
+                _photo_calib["end_angle"] = angle_val
+                _photo_calib["t1"] = now
+                _photo_calib["phase"] = "done"
+                print(f"[photo_calib] 终点触发 angle={angle_val} elapsed={elapsed:.1f}s", flush=True)
 
 
-def _auto_calib_worker():
-    """后台: 开环右转约一圈, 期间采样 (elapsed, cont_raw), 到时停止
-    转动圈数以起终点物理 0° 为绝对锚点, 中途采样仅用于速度校准"""
-    global _auto_calib
-    with _auto_calib_lock:
-        t0 = _auto_calib["t0"]
-        c0 = _auto_calib["c0"]
-        stop_ev = _auto_calib["stop_cmd"] = threading.Event()
-        _auto_calib["phase"] = "turning"
-    dur = 360.0 / get_cfg("pan_speed_dps") + 12.0  # 一圈时长 + 12s 兜底超时
-    samples = []
+def _photo_calib_worker():
+    """后台: 控制云台全速右转一圈, 两次光电触发后校零+测速"""
+    global _last_pan_cont
     try:
-        while not stop_ev.is_set():
-            elapsed = time.time() - t0
-            if elapsed >= dur:
+        with _photo_calib_lock:
+            stop_ev = _photo_calib["stop_cmd"] = threading.Event()
+            _photo_calib["phase"] = "waiting_first"
+        deadline = time.time() + 180.0  # 一圈 + 兜底
+        while time.time() < deadline:
+            with _photo_calib_lock:
+                phase = _photo_calib["phase"]
+            if phase == "done":
                 break
             try:
-                send(pelco.right())
+                send(pelco.right())  # 全速右转找光电触发
             except Exception:  # noqa: BLE001
                 break
-            cont = _read_cont_raw()
-            samples.append((elapsed, cont))
-            # AS5600 增量 ≥16384 raw (=AS5600 4圈≈云台一圈) 即停, 用户微调量最小
-            if c0 is not None and cont is not None and abs(cont - c0) >= 16384:
-                break
-            stop_ev.wait(0.1)
-        # 多次发 stop, 确保云台真正停止 (防止被残留指令覆盖)
+            stop_ev.wait(0.02)
+    finally:
         for _ in range(3):
             try:
                 send(pelco.stop())
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(0.15)
-    except Exception:  # noqa: BLE001
-        try:
-            send(pelco.stop())
-        except Exception:  # noqa: BLE001
-            pass
-    # 等待云台停稳 (连续 3 帧增量 < 3 raw, 最多 5s) 再提示用户
-    last = _read_cont_raw()
-    settled = 0
-    for _ in range(50):
-        time.sleep(0.1)
-        cur = _read_cont_raw()
-        if last is not None and cur is not None and abs(cur - last) < 3:
-            settled += 1
-            if settled >= 3:
-                break
-        else:
-            settled = 0
-        last = cur
-    with _auto_calib_lock:
-        _auto_calib["samples"] = samples
-        _auto_calib["running"] = False
-        _auto_calib["phase"] = "awaiting_confirm"
+        # 结算
+        with _photo_calib_lock:
+            done = _photo_calib["phase"] == "done"
+            start_angle = _photo_calib.get("start_angle")
+            end_angle = _photo_calib.get("end_angle")
+            t0 = _photo_calib["t0"]
+            t1 = _photo_calib["t1"]
+            _photo_calib["running"] = False
+            _photo_calib["phase"] = "idle"
+        result = None
+        if (done and start_angle is not None and end_angle is not None
+                and (t1 - t0) > 1.0):
+            angle_delta = end_angle - start_angle
+            as5600_revs = abs(angle_delta) / 360.0
+            if as5600_revs > 0.1:
+                v_real = 360.0 / (t1 - t0)
+                # 以终点 (第二次光电触发 = 光电 0° 位置) 作为绝对 0 基准
+                _encoder_cal["zero_angle"] = float(end_angle)
+                _last_pan_cont = None
+                _save_encoder_cal()
+                update_config({"pan_speed_dps": v_real})
+                sat_tracker.pan_speed = v_real
+                with tracker.lock:
+                    tracker._finalize()
+                    if mode == "auto":
+                        tracker.pan = 0.0
+                        tracker.tilt = 0.0
+                        tracker._pan_base, tracker._tilt_base = 0.0, 0.0
+                        tracker.pan_accum = 0.0
+                result = {
+                    "ok": True,
+                    "ratio": round(as5600_revs, 4),
+                    "pan_speed_dps": round(v_real, 3),
+                    "as5600_revs": round(as5600_revs, 2),
+                    "zero_angle": round(float(end_angle), 2),
+                    "angle_delta": round(angle_delta, 1),
+                    "elapsed": round(t1 - t0, 1),
+                }
+        if result is None:
+            result = {"ok": False, "detail": "光电校零未完成 (角度差无效或触发不足), 请检查光电传感器/ESP32 累积角度"}
+        with _photo_calib_lock:
+            _photo_calib["result"] = result
 
 
-@app.route("/api/encoder/autocalib", methods=["GET", "POST"])
-def encoder_autocalib():
-    """自动转一圈标定: start(开环右转一圈) -> 用户调回物理 0° -> confirm(计算 rpd + 校准速度)"""
-    global _last_pan_cont
+@app.route("/api/encoder/photocalib", methods=["GET", "POST"])
+def encoder_photocalib():
+    """光电自动校零+测速: 后端控制云台自动转一圈, 两次触发后校零+测速"""
     if request.method == "GET":
-        with _auto_calib_lock:
-            ac = dict(_auto_calib)
-        elapsed = 0.0
-        if ac["t0"]:
-            elapsed = round(time.time() - ac["t0"], 1)
-        return ok({"status": ac["phase"], "running": ac["running"],
-                   "elapsed": elapsed, "c0": ac["c0"]})
+        with _photo_calib_lock:
+            running = _photo_calib["running"]
+            phase = _photo_calib["phase"]
+            result = _photo_calib.get("result")
+        return ok({"running": running, "phase": phase, "result": result})
 
     data = request.get_json(silent=True) or {}
     action = data.get("action")
     if action == "start":
         if is_paused():
             return err("云台处于暂停状态, 请先恢复")
-        with _auto_calib_lock:
-            if _auto_calib["running"] or _auto_calib["phase"] == "turning":
-                return err("自动标定正在进行中")
-            if _cal_origin is None:
-                return err("请先设 0 点 (set_origin)")
-            c0 = _read_cont_raw()
-            if c0 is None:
-                return err("尚未收到 AS5600 raw 数据")
-            _auto_calib["t0"] = time.time()
-            _auto_calib["c0"] = c0
-            _auto_calib["samples"] = []
-            _auto_calib["phase"] = "turning"
-            _auto_calib["running"] = True
-        # 停止其他运动源, 防止并发驱动云台 (覆盖 stop)
+        with _photo_calib_lock:
+            if _photo_calib["running"]:
+                return err("光电校零/测速正在进行中")
+            _photo_calib["running"] = True
+            _photo_calib["mode"] = "auto"
+            _photo_calib["phase"] = "waiting_first"
+            _photo_calib["result"] = None
+        # 停止其他运动源
         try:
             stop_hold()
         except Exception:  # noqa: BLE001
@@ -1548,59 +1752,34 @@ def encoder_autocalib():
             sat_tracker.stop()
         except Exception:  # noqa: BLE001
             pass
-        threading.Thread(target=_auto_calib_worker, daemon=True).start()
-        return ok({"msg": "开始自动标定: 云台右转约一圈, 完成后请把云台调回物理 0° 再点确认"})
+        threading.Thread(target=_photo_calib_worker, daemon=True).start()
+        return ok({"msg": "光电自动校零开始: 云台自动转一圈, 光电触发两次完成校零与测速"})
+    if action == "stop":
+        with _photo_calib_lock:
+            stop_ev = _photo_calib.get("stop_cmd")
+            if not _photo_calib["running"]:
+                return ok({"msg": "当前没有进行中的光电校零/测速"})
+            if stop_ev:
+                stop_ev.set()
+            _photo_calib["running"] = False
+            _photo_calib["phase"] = "idle"
+        try:
+            send(pelco.stop())
+        except Exception:  # noqa: BLE001
+            pass
+        return ok({"msg": "已停止光电校零/测速"})
+    return err("action 需为 start / stop")
 
-    if action == "confirm":
-        with _auto_calib_lock:
-            if _auto_calib["phase"] != "awaiting_confirm":
-                return err("当前无待确认的自动标定 (请先 start)")
-            c0 = _auto_calib["c0"]
-            samples = list(_auto_calib["samples"])
-        if c0 is None:
-            return err("缺少起点数据")
-        c1 = _read_cont_raw()
-        if c1 is None:
-            return err("尚未收到 AS5600 raw 数据")
-        delta = c1 - c0
-        if abs(delta) < 12000 or abs(delta) > 20000:
-            return err(f"转过的 raw 量异常 ({delta}), 请确认云台已回到物理 0° 附近 (一圈约 ±16400)")
-        rpd = delta / 360.0
-        # 速度校准: 固定以 AS5600 4圈(=16384 raw, 物理一圈误差<0.1%)为目标,
-        # 从采样找增量达到 16384 的时刻, 与用户微调量无关, 稳定
-        T_cross = None
-        target = 16384
-        for i in range(1, len(samples)):
-            d_prev = abs(samples[i - 1][1] - c0) if samples[i - 1][1] is not None else 0.0
-            d_cur = abs(samples[i][1] - c0) if samples[i][1] is not None else 0.0
-            if d_cur >= target:
-                if d_cur != d_prev:
-                    frac = (target - d_prev) / (d_cur - d_prev)
-                    T_cross = samples[i - 1][0] + frac * (samples[i][0] - samples[i - 1][0])
-                else:
-                    T_cross = samples[i][0]
-                break
-        # 采样未达到 delta (用户手动微调过), 用自动转动段总时长近似
-        if T_cross is None and samples:
-            T_cross = samples[-1][0]
-        result = {"raw_per_deg": rpd, "ratio": rpd / 4096.0}
-        if T_cross and T_cross > 1.0:
-            v_real = 360.0 / T_cross
-            update_config({"pan_speed_dps": v_real})
-            sat_tracker.pan_speed = v_real
-            result["pan_speed_dps"] = v_real
-            result["delta_raw"] = delta
-        _encoder_cal["raw_per_deg"] = rpd
-        _save_encoder_cal()
-        with tracker.lock:
-            tracker._finalize()
-            tracker.pan_accum = 0.0
-        _last_pan_cont = None
-        with _auto_calib_lock:
-            _auto_calib["phase"] = "done"
-        return ok(result)
 
-    return err("action 需为 start / confirm")
+@app.route("/api/encoder/setzero", methods=["POST"])
+def encoder_setzero():
+    """手动设置当前位置为物理 0° 基准角 (zero_angle = 当前 ESP32 累积角度)"""
+    with _encoder_lock:
+        angle = _encoder_state.get("angle")
+    if angle is None:
+        return err("无编码器数据, 无法设置基准角")
+    _reanchor_zero(float(angle))
+    return ok({"zero_angle": round(float(angle), 2), "msg": f"已设置当前位置为 0° 基准 (angle={angle:.2f})"})
 
 
 if __name__ == "__main__":

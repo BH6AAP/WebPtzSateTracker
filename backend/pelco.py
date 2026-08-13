@@ -38,11 +38,16 @@ class PelcoD:
         return self._frame(0x00, 0x00, 0x00, 0x00)
 
     # ---------- 斜向运动指令 ----------
-    def up_left(self, speed: int = 0x20) -> bytes:
-        return self._frame(0x00, 0x0C, speed & 0x3F, speed & 0x3F)
+    # tilt_speed: 可选, 单独指定俯仰速度 (默认与水平同速)
+    def up_left(self, speed: int = 0x20, tilt_speed: int = None) -> bytes:
+        if tilt_speed is None:
+            tilt_speed = speed
+        return self._frame(0x00, 0x0C, speed & 0x3F, tilt_speed & 0x3F)
 
-    def up_right(self, speed: int = 0x20) -> bytes:
-        return self._frame(0x00, 0x0A, speed & 0x3F, speed & 0x3F)
+    def up_right(self, speed: int = 0x20, tilt_speed: int = None) -> bytes:
+        if tilt_speed is None:
+            tilt_speed = speed
+        return self._frame(0x00, 0x0A, speed & 0x3F, tilt_speed & 0x3F)
 
     def down_left(self, speed: int = 0x20) -> bytes:
         return self._frame(0x00, 0x14, speed & 0x3F, speed & 0x3F)
