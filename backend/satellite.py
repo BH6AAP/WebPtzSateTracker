@@ -52,14 +52,15 @@ def maidenhead_to_latlon(grid: str):
     else:
         lon += 1.0
         lat += 0.5
-    return round(lat, 4), round(lon, 4)
+    return round(lat, 6), round(lon, 6)
 
 
 def set_observer(lat: float, lon: float, alt: float = 0.0):
     with _obs_lock:
-        _observer["lat"] = float(lat)
-        _observer["lon"] = float(lon)
-        _observer["alt"] = float(alt)
+        # 精度保留 6 位小数 (~0.1m 地表分辨率)
+        _observer["lat"] = round(float(lat), 6)
+        _observer["lon"] = round(float(lon), 6)
+        _observer["alt"] = round(float(alt), 2)
     try:
         with open(OBSERVER_FILE, "w", encoding="utf-8") as f:
             json.dump(_observer, f)
@@ -83,6 +84,38 @@ def _load_observer():
 
 
 _load_observer()
+
+
+# 观测站 ECEF 缓存 (观测站坐标极少变化, 每帧计算省去重复三角函数; set_observer 改坐标后自动失效)
+_obs_ecef_cache = None
+
+
+def _observer_ecef() -> tuple:
+    """返回 (obs, obs_ecef), obs_ecef 带缓存"""
+    global _obs_ecef_cache
+    obs = get_observer()
+    c = _obs_ecef_cache
+    if c is not None and c[0] == obs["lat"] and c[1] == obs["lon"] and c[2] == obs["alt"]:
+        return obs, c[3]
+    ecef = _geodetic_to_ecef(obs["lat"], obs["lon"], obs["alt"] / 1000.0)
+    _obs_ecef_cache = (obs["lat"], obs["lon"], obs["alt"], ecef)
+    return obs, ecef
+
+
+# ---------- TLE 数据源 (可配置: config.json 的 tle_urls, 空=默认源) ----------
+DEFAULT_TLE_URLS = list(TLE_URLS)
+_CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+
+def get_tle_urls() -> list:
+    try:
+        with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+            urls = json.load(f).get("tle_urls")
+        if isinstance(urls, list) and urls:
+            return [str(u) for u in urls if str(u).strip()]
+    except Exception:  # noqa: BLE001
+        pass
+    return list(DEFAULT_TLE_URLS)
 
 
 # ---------- TLE 获取与解析 ----------
@@ -114,6 +147,35 @@ def _parse_tle_text(text: str) -> dict:
     return result
 
 
+def _parse_tle_json(text: str) -> dict:
+    """解析 JSON 格式 TLE (SatNOGS 等), 返回 norad_id -> {name,line1,line2}"""
+    result = {}
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return result
+    if not isinstance(data, list):
+        return result
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        line1 = item.get("tle1", "")
+        line2 = item.get("tle2", "")
+        if not (line1.startswith("1 ") and line2.startswith("2 ")):
+            continue
+        norad = str(item.get("norad_cat_id", "")).strip()
+        if not norad:
+            try:
+                norad = line1[2:7].strip()
+            except Exception:  # noqa: BLE001
+                continue
+        name = item.get("tle0", "")
+        if name.startswith("0 "):
+            name = name[2:]
+        result[norad] = {"name": name.strip(), "line1": line1.strip(), "line2": line2.strip()}
+    return result
+
+
 def _fetch_url(url: str, timeout: int = 15) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -127,10 +189,12 @@ def fetch_tle(force: bool = False) -> dict:
         if not force and _tle and (time.time() - _tle_fetch_time) < TLE_MAX_AGE:
             return dict(_tle)
     merged = {}
-    for url in TLE_URLS:
+    for url in get_tle_urls():
         try:
             text = _fetch_url(url)
             parsed = _parse_tle_text(text)
+            if not parsed:
+                parsed = _parse_tle_json(text)
             if parsed:
                 merged.update(parsed)
                 break
@@ -200,6 +264,18 @@ def get_favorites() -> list:
         passes = compute_passes_cached(norad)  # 读后台缓存, 不现场计算
         pos = satellite_position(norad, now)
         cur_el = pos["elevation"] if pos else -90
+        if cur_el > 0:
+            # 正在过境: 用本次过境信息 (passes[0] 是下一次过境, 峰值/时间均不对)
+            cp = current_pass_info(norad, now)
+            if cp is not None:
+                item["next_aos"] = cp["aos"]
+                item["next_los"] = cp["los"]
+                item["max_el"] = round(cp["max_el"], 1)
+                item["aos_az"] = round(cp["aos_az"], 1)
+                item["los_az"] = round(cp["los_az"], 1)
+                item["status"] = "in_pass"
+                enriched.append((0, item))
+                continue
         if passes:
             p = passes[0]
             item["next_aos"] = p["aos"]
@@ -239,6 +315,7 @@ def add_favorite(norad_id: str) -> bool:
 
 
 def remove_favorite(norad_id: str) -> bool:
+    global _favorites
     norad_id = str(norad_id)
     with _fav_lock:
         before = len(_favorites)
@@ -249,6 +326,25 @@ def remove_favorite(norad_id: str) -> bool:
     return False
 
 
+def _load_tle_cache():
+    """启动时从 tle_cache.json 预热内存 TLE: 请求路径零网络等待。
+    否则服务重启后首个 /api/favorites 请求会同步 fetch_tle (最长 30s 网络超时),
+    造成"偶尔列表加载不出来"。
+    """
+    global _tle, _tle_fetch_time
+    try:
+        if os.path.exists(TLE_CACHE_FILE):
+            with open(TLE_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                with _tle_lock:
+                    _tle = data
+                    _tle_fetch_time = time.time()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_load_tle_cache()
 _load_favorites()
 
 
@@ -332,8 +428,7 @@ def satellite_position(norad_id: str, when: float | None = None):
     e, r, v = sat.sgp4(jd, fr)
     if e != 0:
         return None
-    obs = get_observer()
-    obs_ecef = _geodetic_to_ecef(obs["lat"], obs["lon"], obs["alt"] / 1000.0)
+    obs, obs_ecef = _observer_ecef()
     sat_ecef = _teme_to_ecef(r, jd + fr)
     az, el = _ecef_to_azel(obs_ecef, sat_ecef, obs["lat"], obs["lon"])
     # 星下点 (卫星 ECEF -> 经纬度)
@@ -348,6 +443,93 @@ def satellite_position(norad_id: str, when: float | None = None):
         "sub_lat": round(slat, 2),
         "sub_lon": round(slon, 2),
         "alt_km": round(alt_km, 0),
+        "visible": el > 0,
+    }
+
+
+# ---------- 月球位置 (Meeus 低精度算法, 误差 ~0.3°, 云台跟踪足够) ----------
+def moon_position(when: float | None = None):
+    """计算月球站心方位角/仰角/距离, 返回 dict 或 None (与 satellite_position 同构)"""
+    when = time.time() if when is None else when
+    dt = datetime.fromtimestamp(when, tz=timezone.utc)
+    jd, fr = jday(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second + dt.microsecond / 1e6)
+    T = (jd + fr - 2451545.0) / 36525.0
+    r = math.radians
+    # 月球地心黄经/黄纬/距离 (主要摄动项)
+    Lp = r(218.3164477 + 481267.88123421 * T)
+    D = r(297.8501921 + 445267.1114034 * T)
+    M = r(357.5291092 + 35999.0502909 * T)
+    Mp = r(134.9633964 + 477198.8675055 * T)
+    F = r(93.2720950 + 483202.0175233 * T)
+    lam = Lp + r(6.289 * math.sin(Mp) + 1.274 * math.sin(2 * D - Mp)
+                 + 0.658 * math.sin(2 * D) + 0.214 * math.sin(2 * Mp)
+                 - 0.186 * math.sin(M) - 0.059 * math.sin(2 * D - 2 * Mp)
+                 - 0.057 * math.sin(2 * D - M - Mp) + 0.053 * math.sin(2 * D + Mp))
+    beta = r(5.128 * math.sin(F) + 0.281 * math.sin(Mp + F)
+             - 0.278 * math.sin(Mp - F) - 0.173 * math.sin(2 * D - F))
+    dist = 385001 - 20905 * math.cos(Mp) - 3699 * math.cos(2 * D - Mp) - 2956 * math.cos(2 * D)
+    # 黄道 -> 赤道 (RA/DEC)
+    eps = r(23.4392911 - 0.0130042 * T)
+    sin_b, cos_b = math.sin(beta), math.cos(beta)
+    sin_l, cos_l = math.sin(lam), math.cos(lam)
+    sin_e, cos_e = math.sin(eps), math.cos(eps)
+    dec = math.asin(sin_b * cos_e + cos_b * sin_e * sin_l)
+    ra = math.atan2(sin_l * cos_e - math.tan(beta) * sin_e, cos_l)  # [-pi,pi]
+    # 地心赤道坐标 -> ECEF (绕 Z 轴转 GMST, 与 TEME->ECEF 同法)
+    theta = math.radians(_gmst_deg(jd + fr))
+    rm = dist  # km
+    mx = rm * math.cos(dec) * math.cos(ra)
+    my = rm * math.cos(dec) * math.sin(ra)
+    mz = rm * math.sin(dec)
+    c, s = math.cos(theta), math.sin(theta)
+    moon_ecef = (mx * c + my * s, -mx * s + my * c, mz)
+    obs, obs_ecef = _observer_ecef()
+    az, el = _ecef_to_azel(obs_ecef, moon_ecef, obs["lat"], obs["lon"])
+    return {
+        "azimuth": round(az, 1),
+        "elevation": round(el, 1),
+        "distance": round(dist, 0),
+        "visible": el > 0,
+    }
+
+
+# ---------- 太阳位置 (Meeus 太阳几何, 误差 ~0.01°, 与 moon_position 同构) ----------
+def sun_position(when: float | None = None):
+    """计算太阳站心方位角/仰角/距离, 返回 dict 或 None (与 moon_position 同构)"""
+    when = time.time() if when is None else when
+    dt = datetime.fromtimestamp(when, tz=timezone.utc)
+    jd, fr = jday(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second + dt.microsecond / 1e6)
+    T = (jd + fr - 2451545.0) / 36525.0
+    r = math.radians
+    # 太阳几何 (黄经 = 平均黄经 + 中心差, 精度 ~0.01°)
+    L0 = 280.46646 + 36000.76983 * T + 0.0003032 * T * T
+    M = 357.52911 + 35999.05029 * T - 0.0001537 * T * T
+    M_r = r(M)
+    C = (1.914602 - 0.004817 * T - 0.000014 * T * T) * math.sin(M_r) \
+        + (0.019993 - 0.000101 * T) * math.sin(2 * M_r) \
+        + 0.000289 * math.sin(3 * M_r)
+    lam = r(L0 + C)
+    dist_au = 1.000001018 * (1 - 0.016708634 * math.cos(M_r) - 0.000139737 * math.cos(2 * M_r))
+    # 黄道 -> 赤道 (RA/DEC)
+    eps = r(23.439291 - 0.0130042 * T)
+    sin_e, cos_e = math.sin(eps), math.cos(eps)
+    sin_l, cos_l = math.sin(lam), math.cos(lam)
+    ra = math.atan2(cos_e * sin_l, cos_l)          # [-pi,pi]
+    dec = math.asin(sin_e * sin_l)
+    dist = dist_au * 149597870.7                    # AU -> km
+    # 地心赤道坐标 -> ECEF (绕 Z 轴转 GMST, 与月球同法)
+    theta = math.radians(_gmst_deg(jd + fr))
+    mx = dist * math.cos(dec) * math.cos(ra)
+    my = dist * math.cos(dec) * math.sin(ra)
+    mz = dist * math.sin(dec)
+    c, s = math.cos(theta), math.sin(theta)
+    sun_ecef = (mx * c + my * s, -mx * s + my * c, mz)
+    obs, obs_ecef = _observer_ecef()
+    az, el = _ecef_to_azel(obs_ecef, sun_ecef, obs["lat"], obs["lon"])
+    return {
+        "azimuth": round(az, 1),
+        "elevation": round(el, 1),
+        "distance": round(dist, 0),
         "visible": el > 0,
     }
 
@@ -414,6 +596,63 @@ def _refine_peak(norad_id: str, center_t: float, coarse: float) -> tuple | None:
     return (best_el, best_t)
 
 
+def current_pass_info(norad_id: str, now: float | None = None) -> dict | None:
+    """计算正在进行的过境段信息, 返回 {aos, los, aos_az, los_az, max_el, max_t} 或 None。
+
+    用途: 卫星当前在轨时, compute_passes 从"现在"起扫无法识别已开始的过境,
+    passes[0] 实际是下一次过境。本函数回溯找本次 AOS、前扫找 LOS,
+    并计算本次过境的完整峰值 (含未来未到达部分)。
+    """
+    now = time.time() if now is None else now
+    if _get_satrec(norad_id) is None:
+        return None
+    pos = satellite_position(norad_id, now)
+    if pos is None or pos["elevation"] <= 0:
+        return None
+    # 回溯找本次 AOS (仰角由负转正), 最多 6 小时
+    aos, aos_az = None, 0.0
+    t = now
+    prev_el = None
+    for _ in range(720):
+        p = satellite_position(norad_id, t)
+        el = p["elevation"] if p else -90
+        if prev_el is not None and prev_el < 0 <= el:
+            aos, aos_az = t, p["azimuth"] if p else 0.0
+            break
+        prev_el = el
+        t -= 30.0
+    if aos is None:
+        aos = max(0.0, now - 6 * 3600)
+    # 前扫找本次 LOS (仰角由正转负), 最多 6 小时
+    los, los_az = None, 0.0
+    t = now
+    prev_el = None
+    for _ in range(720):
+        p = satellite_position(norad_id, t)
+        el = p["elevation"] if p else -90
+        if prev_el is not None and prev_el >= 0 > el:
+            los, los_az = t, p["azimuth"] if p else 0.0
+            break
+        prev_el = el
+        t += 30.0
+    if los is None:
+        los = now + 6 * 3600
+    # 本次过境全段峰值 (粗扫 30s + 峰值附近 1s 细扫)
+    max_el, max_t = -90.0, now
+    x = aos
+    while x <= los:
+        p = satellite_position(norad_id, x)
+        el = p["elevation"] if p else -90
+        if el > max_el:
+            max_el, max_t = el, x
+        x += 30.0
+    peak = _refine_peak(norad_id, max_t, 30.0)
+    if peak is not None:
+        max_el, max_t = peak
+    return {"aos": aos, "los": los, "aos_az": aos_az, "los_az": los_az,
+            "max_el": max_el, "max_t": max_t}
+
+
 # ---------- 过境缓存与后台任务 ----------
 _pass_cache = {}            # norad -> {"time": 计算时间戳, "passes": [...]}
 _pass_cache_lock = threading.Lock()
@@ -422,16 +661,126 @@ PASSES_HOURS = 48.0         # 缓存过境计算时长
 
 
 def compute_passes_cached(norad_id: str, force: bool = False) -> list:
-    """读取过境缓存, 未缓存或过期时现场计算并写入缓存"""
+    """读取过境缓存; 未缓存时现场计算, 过期时返回旧值并交后台重算 (请求不阻塞)"""
     norad = str(norad_id)
     with _pass_cache_lock:
         c = _pass_cache.get(norad)
         if c and not force and (time.time() - c["time"]) < PASSES_CACHE_AGE:
             return list(c["passes"])
+        stale = list(c["passes"]) if c else None
+    if stale is not None and not force:
+        # 有旧数据: 立即返回旧值, 48h×30s 步进的 SGP4 重算 (~1s/颗) 放后台,
+        # 避免请求线程被计算阻塞拖慢前端列表 (偶发"列表加载不出来")
+        _kick_pass_refresh(norad)
+        return stale
+    t0 = time.time()
     passes = compute_passes(norad, hours=PASSES_HOURS, min_elev=0)
+    print(f"[passes] {norad} 冷计算 {time.time() - t0:.2f}s / {len(passes)} 场", flush=True)
     with _pass_cache_lock:
         _pass_cache[norad] = {"time": time.time(), "passes": passes}
     return passes
+
+
+_pass_kick_lock = threading.Lock()
+
+
+def _kick_pass_refresh(norad: str) -> None:
+    """触发单颗卫星的后台过境重算 (并发去重: 已在重算则跳过)"""
+    if not _pass_kick_lock.acquire(blocking=False):
+        return
+
+    def _bg():
+        try:
+            passes = compute_passes(norad, hours=PASSES_HOURS, min_elev=0)
+            with _pass_cache_lock:
+                _pass_cache[norad] = {"time": time.time(), "passes": passes}
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _pass_kick_lock.release()
+
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+# ---------- 轨迹/雷达图缓存: 选中卫星时秒开, 过期返回旧值并后台重算 ----------
+class SwrCache:
+    """stale-while-revalidate 缓存
+    未过期直接返回; 过期返回旧值并触发后台重算; 首次(无旧值)现场计算。
+    compute 闭包返回 None 时不缓存。
+    """
+
+    def __init__(self, ttl: float):
+        self.ttl = ttl
+        self._data = {}        # key -> {"time": ts, "value": ...}
+        self._lock = threading.Lock()
+        self._busy = set()     # 正在重算的 key (去重, 防重复线程)
+
+    def get(self, key: str, compute):
+        with self._lock:
+            c = self._data.get(key)
+            if c and (time.time() - c["time"]) < self.ttl:
+                return c["value"]
+            stale = c["value"] if c else None
+            need_recalc = key not in self._busy
+            if need_recalc:
+                self._busy.add(key)
+        if stale is not None:
+            if need_recalc:
+                self._spawn(key, compute)
+            return stale
+        value = compute()  # 首次: 无旧值可回, 现场算一次
+        with self._lock:
+            self._busy.discard(key)
+            if value is not None:
+                self._data[key] = {"time": time.time(), "value": value}
+        return value
+
+    def _spawn(self, key: str, compute):
+        def _bg():
+            try:
+                v = compute()
+                with self._lock:
+                    self._busy.discard(key)
+                    if v is not None:
+                        self._data[key] = {"time": time.time(), "value": v}
+            except Exception:  # noqa: BLE001
+                with self._lock:
+                    self._busy.discard(key)
+        threading.Thread(target=_bg, daemon=True).start()
+
+
+_track_cache = SwrCache(600.0)   # 星下点轨迹 10 分钟
+_radar_cache = SwrCache(60.0)    # 雷达图点位 1 分钟
+
+
+def compute_track_cached(norad_id: str, hours: float, step: float) -> list:
+    """星下点轨迹 (缓存版): 返回 [{lat, lon, t}...], 调用方按 t>=now 过滤陈旧头部"""
+    def _compute():
+        points = []
+        end = time.time() + hours * 3600
+        t = time.time()
+        while t <= end:
+            pos = satellite_position(norad_id, t)
+            if pos:
+                points.append({"lat": pos["sub_lat"], "lon": pos["sub_lon"], "t": t})
+            t += step
+        return points
+    return _track_cache.get(f"{norad_id}|{hours}|{step}", _compute)
+
+
+def compute_radar_cached(norad_id: str, minutes: float, step: float) -> list:
+    """雷达图 az/el 点位 (缓存版): 返回 [{az, el, t}...]"""
+    def _compute():
+        points = []
+        end = time.time() + minutes * 60
+        t = time.time()
+        while t <= end:
+            pos = satellite_position(norad_id, t)
+            if pos:
+                points.append({"az": pos["azimuth"], "el": pos["elevation"], "t": t})
+            t += step
+        return points
+    return _radar_cache.get(f"{norad_id}|{minutes}|{step}", _compute)
 
 
 _pass_updating = threading.Lock()
@@ -470,6 +819,8 @@ def start_background_jobs() -> None:
 
     threading.Thread(target=_tle_loop, daemon=True).start()
     threading.Thread(target=_passes_loop, daemon=True).start()
+    # 启动后立即后台拉取最新 TLE (网络失败自动回退 tle_cache.json), 不阻塞请求
+    threading.Thread(target=lambda: fetch_tle(force=True), daemon=True).start()
     # 启动后立即在后台算一次过境, 不阻塞服务启动
     threading.Thread(target=update_all_passes, daemon=True).start()
 
@@ -499,10 +850,18 @@ class SatelliteTracker:
         self.accel_time = 0.5     # 保留字段, 线性模型下不使用
         self._last_pan_dir = None   # 上次水平方向 (用于 hysteresis)
         self._last_tilt_dir = None  # 上次俯仰方向 (用于 hysteresis)
+        self._pan_moving = False    # 水平是否在持续移动 (预测停判断用)
         # 分段跟踪状态
         self._pan_unwrapped = None      # 连续化后的云台 pan (沿最短路径累加)
         self._target_az_unwrapped = None  # 当前段目标方位 (连续化)
         self._target_el = None          # 当前段目标仰角
+        self.target = "sat"             # 跟踪目标类型: 'sat' / 'moon'
+        self._target_fn = None          # 目标位置函数: t -> {"azimuth","elevation",...}
+        self._hb = 0.0                  # 跟踪循环心跳时间戳 (看门狗监控用)
+        # 惯性推算 (UDP 丢失时开环跟踪)
+        self._dr_start_pan = None  # 断联时的最后编码器角度
+        self._dr_start_time = 0.0  # 断联时刻
+        self._dr_start_dir = 0     # 断联时的方向: 1=right, -1=left, 0=stop
 
     def _time_for_angle(self, angle: float, speed: float) -> float:
         """纯线性模型: 时间 = 角度 / 速度 (忽略启动加速)"""
@@ -516,52 +875,88 @@ class SatelliteTracker:
             return 0.0
         return speed * elapsed
 
-    def start(self, norad_id: str):
+    def start(self, norad_id: str, target: str = "sat"):
+        """启动跟踪. target: 'sat'=卫星(norad_id) / 'moon'=月球 / 'sun'=太阳 (后两者忽略 norad_id)"""
         self.stop()  # 先停止旧线程 (stop 内部自行加锁)
         with self._lock:
-            self.norad_id = norad_id
-            self._stop = threading.Event()
-            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self.target = target if target in ("moon", "sun") else "sat"
+            self.norad_id = str(norad_id) if target == "sat" else target
+            if target == "moon":
+                self._target_fn = moon_position
+            elif target == "sun":
+                self._target_fn = sun_position
+            else:
+                self._target_fn = lambda t, n=self.norad_id: satellite_position(n, t)
+            # 每个线程一个私有 stop Event (参数传入), 避免 join 超时的旧线程
+            # 通过 self._stop 属性"复活"到新 Event 上而失联永生
+            stop_ev = threading.Event()
+            self._stop = stop_ev
+            self._pan_moving = False  # 新跟踪周期: 水平初始静止
+            self._hb = time.time()    # 心跳初始化为当前时刻
+            self._thread = threading.Thread(target=self._loop, args=(stop_ev,), daemon=True)
             self._thread.start()
+            # 看门狗: 循环心跳超时(阻塞/卡死)时强制发 stop, 防云台单帧锁存持续转动
+            threading.Thread(target=self._watchdog, args=(stop_ev,), daemon=True).start()
 
     def stop(self):
+        t = None
         with self._lock:
-            if self._thread is not None:
+            if self._stop is not None:
                 self._stop.set()
-                self._thread.join(timeout=0.5)
-                self._thread = None
+            t = self._thread
+            self._thread = None
             self.norad_id = None
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
 
     def is_tracking(self) -> bool:
         with self._lock:
-            return self._thread is not None
+            return self._thread is not None and self._thread.is_alive()
+
+    def _watchdog(self, stop_ev):
+        """跟踪看门狗: 若跟踪循环心跳超时(线程阻塞/卡死), 强制发送 stop 帧。
+        云台为单帧锁存型: 收到一帧 move 后持续转动直到 stop 帧,
+        循环阻塞数秒未发 stop 会导致云台"突然连续转动"。
+        """
+        while not stop_ev.is_set():
+            time.sleep(0.5)
+            if time.time() - self._hb > 2.5:
+                print("[track] watchdog: 循环心跳超时 >2.5s, 强制停止云台", flush=True)
+                try:
+                    self.send_dir("stop")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._hb = time.time()   # 防连续触发刷屏
 
     def _pan_delta(self, az: float, pan: float) -> float:
         """最短路径方位角差: 结果范围 [-180, 180], 自动处理 0/360 越线"""
         return (az - pan + 180) % 360 - 180
 
-    def _drive(self, direction: str, seconds: float, ignore_stop: bool = False):
+    def _drive(self, direction: str, seconds: float, ignore_stop: bool = False,
+               stop_ev=None):
         """在指定时间内持续发送同一方向指令 (每 100ms 一帧)
         ignore_stop=True 时不检查 _stop (用于独立的 move_to 线程)
+        stop_ev: 跟踪线程私有停止标志 (None 时用 self._stop)
         """
         if seconds <= 0:
             return
+        ev = stop_ev if stop_ev is not None else self._stop
         end = time.time() + seconds
         while time.time() < end:
-            if not ignore_stop and self._stop.is_set():
+            if not ignore_stop and ev.is_set():
                 return
             self.send_dir(direction)
             if ignore_stop:
                 time.sleep(0.1)
             else:
-                self._stop.wait(0.1)
+                ev.wait(0.1)
 
     def move_to(self, target_pan=None, target_tilt=None, timeout: float = 15.0):
         """移动到指定 pan/tilt 位置, 用于测试运动精度"""
         pos = self.get_position()
         if pos is None:
             return False
-        pan, tilt = pos
+        pan, tilt, _ = pos
         threshold = 0.5  # 指定位置用更精确的死区
         pan_need = False
         pan_dir = None
@@ -598,25 +993,27 @@ class SatelliteTracker:
         self.send_dir("stop")
         return True
 
-    def _loop(self):
+    def _loop(self, stop_ev=None):
         """闭环跟踪: 预测性控制, 根据卫星角速度提前瞄准
+
+        stop_ev: 本线程私有停止标志 (线程内禁止通过 self._stop 访问,
+                 防止 start() 替换 Event 后旧线程失联)
 
         改进点:
         - 动态提前量: 基础 0.3s + 角速度补偿, 卫星越快提前越多 (原 1.0s,
           过境方位速率 ~1.5°/s 时稳态超前 ~2° 的提前偏差已降至 <1°)
         - 角速度预测: 记录方位/仰角变化率, 叠加反应延迟内的预测位移
-        - 小步快跑: 俯仰死区 0.5° (原 1°), 步长 0.5°, 反应更快
-        - 水平 1° 一调整: 减少启停次数, 减小滑行吞量按次数累积的超前
+        - 取消脉冲点动 (大天线: 频繁启停抖动被放大): 恒速持续移动 + 预测停,
+          误差超死区才启动; 移动中误差进入滑行窗口即提前停, 靠惯性滑进
+          死区, 避免全速过冲反向 (左右抽搐根源)。窄八木死区取 1.5°
+        - 俯仰: 死区/步长 1.0°, 减少启停
         """
         cycle = 0.1
-        deadzone = 1.0       # 水平死区(度): 1° 一调整 (原 0.4°)。减少启停次数,
-                             # 每次脉冲滑行吞量(死区1下~0.07°)在闭环中按次数 N 累积,
-                             # 放大死区减少 N 直接成比例减小累积超前, 且单次步长
-                             # 内 AS5600 增量远大于抖动, 测量更可靠
-        move_per_cycle = self.pan_speed * cycle
-        pulse_zone = move_per_cycle + deadzone
-        tilt_step = 0.5      # 俯仰死区/步长(度): 小步快跑
-        lead_s = 0.3         # 基础提前量(秒): 查询未来位置 (原 1.0s, 稳态超前 ~2° 降至 <1°)
+        deadzone = 0.8       # 水平死区(度): 曾 1.5 致稳态落后卫星 ~1°; 收窄后稳态 <0.8°
+        stop_lead = 2.0      # 预测停窗口(度): 移动中误差<此值提前停, 靠滑行入死区
+                             # (滑行距离实测约 <1°, 此值=死区+滑行余量)
+        tilt_step = 1.0      # 俯仰死区/步长(度): 原 0.5° 小步快跑, 大天线放宽减启停
+        lead_s = 1.2         # 基础提前量(秒): 查询未来位置, 云台提前到位等待而非追赶
         reaction_s = 0.3     # 云台反应延迟(秒): 额外预测补偿
 
         # 角速度跟踪
@@ -624,15 +1021,19 @@ class SatelliteTracker:
         prev_el = None
         prev_t = None
 
-        while not self._stop.is_set():
+        while not stop_ev.is_set():
             cycle_start = time.time()
+            self._hb = cycle_start   # 心跳: 看门狗据此判断循环是否卡死
             try:
+                t_mark = time.time()
                 now = time.time()
-                sat = satellite_position(self.norad_id, now + lead_s)
-                if sat is None:
+                tgt = self._target_fn(now + lead_s) if self._target_fn else None
+                t_target = time.time() - t_mark
+                if tgt is None:
+                    print("[track] 目标位置计算失败 (TLE/SGP4), 停止跟踪", flush=True)
                     self.send_dir("stop")
                     break
-                az, el = sat["azimuth"], sat["elevation"]
+                az, el = tgt["azimuth"], tgt["elevation"]
 
                 # ---- 计算角速度 (用连续周期的未来位置差分) ----
                 az_rate = 0.0
@@ -650,11 +1051,50 @@ class SatelliteTracker:
                 az_target = az + az_rate * reaction_s
                 el_target = el + el_rate * reaction_s
 
-                pan, tilt = self.get_position()
+                t_mark = time.time()
+                pan, tilt, enc_ok = self.get_position()
+                t_pos = time.time() - t_mark
+                if not enc_ok:
+                    # 编码器失联: 开环惯性推算 (卫星角速度, 不依赖 PTZ 速度)
+                    _max_dr = 3.0   # 开环最长 3s, 超时停转防盲转
+                    if self._dr_start_pan is not None and self._dr_start_dir != 0:
+                        now = time.time()
+                        dr_elapsed = now - self._dr_start_time
+                        if dr_elapsed > _max_dr:
+                            print(f"[track] 开环推算超时 {dr_elapsed:.0f}s, 停止", flush=True)
+                            if self._pan_moving:
+                                self._pan_moving = False
+                                self.send_dir("stop")
+                            stop_ev.wait(0.1)
+                            continue
+                        # 用卫星角速度估算移, 不是用 PTZ 速度 (PTZ 有预测停并非一直运动)
+                        pan = (self._dr_start_pan + az_rate * dr_elapsed) % 360.0
+                        # 开环驱动: 保持最后方向, 不管 daz
+                        dir_str = "right" if self._dr_start_dir > 0 else "left"
+                        if not self._pan_moving:
+                            self._pan_moving = True
+                        self.send_dir(dir_str)
+                        # 开环期间跳过 daz/pan_mode 等反馈逻辑, 仅处理 tilt
+                        _dr_active = True
+                    else:
+                        if self._pan_moving:
+                            self._pan_moving = False
+                            self.send_dir("stop")
+                        stop_ev.wait(0.1)
+                        continue
+                else:
+                    # 编码器正常: 标记非开环 (状态保存移到 daz 计算之后,
+                    # 此处引用 daz 会 UnboundLocalError 且被 except 吞掉 -> 云台不动无日志)
+                    _dr_active = False
                 daz = self._pan_delta(az_target, pan)
                 del_ = el_target - tilt
+                if enc_ok:
+                    # 保存状态供开环推算使用 (daz 已定义)
+                    self._dr_start_pan = pan
+                    self._dr_start_time = now
+                    self._dr_start_dir = 1 if daz > 0 else -1 if daz < 0 else 0
 
-                # ---- 俯仰: 小步快跑, 死区 0.5° ----
+                # ---- 俯仰: 死区 + 步进 (无编码器, 只能按时长驱动) ----
                 tilt_dir = None
                 if el_target > 0 and self.tilt_min <= el_target <= self.tilt_max:
                     if del_ > tilt_step:
@@ -666,42 +1106,56 @@ class SatelliteTracker:
                 elif tilt_dir == "down" and tilt <= self.tilt_min + 0.01:
                     tilt_dir = None
 
-                # ---- 水平: 三段控制 (AS5600 闭环) ----
-                adaz = abs(daz)
-                if adaz <= deadzone:
-                    pan_mode = "stop"
-                elif adaz <= pulse_zone:
-                    pan_mode = "pulse"
-                else:
-                    pan_mode = "move"
-                pan_dir = "right" if daz > 0 else "left"
+                if not _dr_active:
+                    # ---- 水平: 死区 + 持续移动 + 预测停 (AS5600 闭环, 恒速 7.5°/s) ----
+                    adaz = abs(daz)
+                    if self._pan_moving and adaz <= stop_lead:
+                        pan_mode = "stop"
+                    elif adaz <= deadzone:
+                        pan_mode = "stop"
+                    else:
+                        pan_mode = "move"
+                    if (pan >= self.pan_max and daz > 0) or (pan <= self.pan_min and daz < 0):
+                        pan_mode = "stop"
+                    pan_dir = "right" if daz > 0 else "left"
+                    self._dr_start_dir = 1 if daz > 0 else -1 if daz < 0 else 0
 
-                if tilt_dir is not None and pan_mode != "stop":
-                    print(f"[track] az={az:.1f} pan={pan:.1f} daz={daz:.1f} "
-                          f"az_rate={az_rate:.2f} el={el:.1f} tilt={tilt:.1f} del={del_:.1f} "
-                          f"el_rate={el_rate:.2f} pan={pan_mode} tilt={tilt_dir}", flush=True)
+                    if pan_mode != "stop" or tilt_dir is not None:
+                        # 水平或俯仰任一在动即打印 (此前要求俯仰在动才打,
+                        # 卫星在地平线下 el<0 时水平驱动无日志, 形成观测盲区)
+                        print(f"[track] az={az:.1f} pan={pan:.1f} daz={daz:.1f} "
+                              f"az_rate={az_rate:.2f} el={el:.1f} tilt={tilt:.1f} del={del_:.1f} "
+                              f"el_rate={el_rate:.2f} pan={pan_mode} tilt={tilt_dir}", flush=True)
 
-                # ---- 发送指令 ----
-                if pan_mode == "move":
-                    self.send_dir(tilt_dir + pan_dir if tilt_dir is not None else pan_dir)
-                elif tilt_dir is not None:
-                    # 俯仰步进: 运行步长所需时间, 到位后重新评估
-                    speed = self.tilt_up_speed if tilt_dir == "up" else self.tilt_down_speed
-                    self._drive(tilt_dir, tilt_step / speed)
-                    self.send_dir("stop")
-                    continue
-                elif pan_mode == "pulse":
-                    # 动态时长点动: 按误差/速度计算脉冲时长, 精确消除残差
-                    # (AS5600 实测位置在下一周期作为新起点, 形成闭环修正)
-                    sec = max(0.03, adaz / self.pan_speed)
-                    self.send_dir(pan_dir)
-                    self._stop.wait(sec)
-                    self.send_dir("stop")
+                    # ---- 发送指令 ----
+                    if pan_mode == "move":
+                        self._pan_moving = True
+                        t_mark = time.time()
+                        self.send_dir(tilt_dir + pan_dir if tilt_dir is not None else pan_dir)
+                        t_send = time.time() - t_mark
+                        if max(t_target, t_pos, t_send) > 0.3:
+                            print(f"[track] SLOW tgt={t_target:.2f}s pos={t_pos:.2f}s "
+                                  f"send={t_send:.2f}s", flush=True)
+                    elif tilt_dir is not None:
+                        self._pan_moving = False
+                        speed = self.tilt_up_speed if tilt_dir == "up" else self.tilt_down_speed
+                        self._drive(tilt_dir, tilt_step / speed, stop_ev=stop_ev)
+                        self.send_dir("stop")
+                        continue
+                    else:
+                        self._pan_moving = False
+                        self.send_dir("stop")
                 else:
-                    self.send_dir("stop")
-            except Exception:  # noqa: BLE001
-                pass
+                    # 开环期间: 仅处理俯仰 (水平已由上面开环路径驱动)
+                    if tilt_dir is not None:
+                        speed = self.tilt_up_speed if tilt_dir == "up" else self.tilt_down_speed
+                        self._drive(tilt_dir, tilt_step / speed, stop_ev=stop_ev)
+                        self.send_dir("stop")
+                        continue
+            except Exception as e:  # noqa: BLE001
+                # 静默吞异常会导致"跟踪在跑但云台不动且无日志"的诊断黑洞
+                print(f"[track] 循环异常: {e!r}", flush=True)
             elapsed = time.time() - cycle_start
             remaining = cycle - elapsed
             if remaining > 0:
-                self._stop.wait(remaining)
+                stop_ev.wait(remaining)

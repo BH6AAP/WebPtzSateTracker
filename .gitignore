@@ -26,3 +26,16 @@ deploy.local.sh
 *.log
 .idea/
 .vscode/
+
+# ===== 运行时数据 (根目录) =====
+sat_observer.json
+tle_cache.json
+*.bak
+*.git_working
+
+# ===== 编译产物 =====
+build*/
+*.bin
+*.elf
+*.map
+*.sdkconfig

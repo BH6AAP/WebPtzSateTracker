@@ -11,35 +11,50 @@
   let followSat = false;    // 是否跟随卫星 (点击卫星后开启, 手动拖动地图时关闭)
   let tracking = false;
   let radarPoints = [];
+  let radarPass = null;   // 当前显示过境的 pass 元数据 (AOS 标记)
   let radarTimer = null;
   let infoTimer = null;
   let obsMarker = null;
 
-  // ===== 地图初始化 (本地地球纹理, 等距圆柱投影, 左右无缝衔接) =====
+  // ===== 地图初始化 (天地图矢量瓦片, Web Mercator 投影) =====
+  // ⚠️ 需要使用天地图开发者 token. 免费申请: https://uums.tianditu.gov.cn/register
+  // 注册后 → 控制台 → 创建新应用 (选择"浏览器端") → 获取 Key, 填入下方 TDT_KEY
+  const TDT_KEY = 'd0ca322ca9f024d7673cd4d91e588290';  // ← 天地图 API Key
+
   function initMap() {
-    const bounds = [[-90, -180], [90, 180]];
     map = L.map('map', {
-      crs: L.CRS.EPSG4326,
-      minZoom: 2, maxZoom: 6,
+      minZoom: 2, maxZoom: 18,
       zoomControl: false,
-      worldCopyJump: true   // 拖过边缘自动跳转, 实现左右无缝
+      worldCopyJump: true   // 拖过边缘自动跳转
     });
     // 缩放按钮放置右下角
     L.control.zoom({ position: 'bottomright' }).addTo(map);
     window.map = map;
-    // 地球纹理铺 3 份, 保证左右拖动时始终有图
-    for (let off = -360; off <= 360; off += 360) {
-      L.imageOverlay('earth_diffuse.jpg', [[-90, -180 + off], [90, 180 + off]]).addTo(map);
+// 底图: 天地图矢量瓦片 (含行政边界) — 通过后端代理绕过 WAF
+    L.tileLayer('/tdt/vec/{z}/{x}/{y}', {
+      maxZoom: 18,
+      attribution: '&copy; 天地图'
+    }).addTo(map);
+    // 天地图行政标注层 (地名、行政名称)
+    if (TDT_KEY) {
+      L.tileLayer('/tdt/cva/{z}/{x}/{y}', {
+        maxZoom: 18,
+        attribution: '&copy; 天地图'
+      }).addTo(map);
     }
+    // OSM 兜底: 如果天地图 vec_w 因网络问题未加载, 不额外处理
     // 以观测站为中心并显示观测站位置
     fetch('/api/sat/observer').then(r => r.json()).then(d => {
       if (d.ok) {
         map.setView([d.lat, d.lon], 3);
+        window.obsPos = [d.lat, d.lon];
         obsMarker = L.circleMarker([d.lat, d.lon], {
           radius: 6, color: '#ef4444', fillColor: '#ef4444', fillOpacity: 1
         }).addTo(map).bindPopup('观测站');
       }
-    }).catch(() => { map.setView([20, 0], 2); });
+    }).catch(() => { map.setView([20, 0], 2); window.obsPos = [20, 0]; });
+    // ponytail: 暴露观测站标记给 inline script 画方向线
+    window.obsMarker = obsMarker;
   }
 
   // 保存观测站后刷新地图中心与标记
@@ -49,10 +64,12 @@
       const d = await r.json();
       if (d.ok) {
         map.setView([d.lat, d.lon], 3);
+        window.obsPos = [d.lat, d.lon];
         if (obsMarker) map.removeLayer(obsMarker);
         obsMarker = L.circleMarker([d.lat, d.lon], {
           radius: 6, color: '#ef4444', fillColor: '#ef4444', fillOpacity: 1
         }).addTo(map).bindPopup('观测站');
+        window.obsMarker = obsMarker;
       }
     } catch (e) { /* 忽略 */ }
   }
@@ -102,7 +119,9 @@
         });
         item.querySelector('.del').addEventListener('click', async (e) => {
           e.stopPropagation();
-          await fetch('/api/sat/favorites/' + f.norad, { method: 'DELETE' });
+          const res = await fetch('/api/sat/favorites/' + f.norad, { method: 'DELETE' });
+          const d = await res.json().catch(() => ({}));
+          if (!d.ok) { toast('删除失败: ' + (d.error || d.detail || '')); return; }
           delete trackLayers[f.norad];
           if (satPosMarkers[f.norad]) {
             map.removeLayer(satPosMarkers[f.norad].circle);
@@ -119,6 +138,36 @@
         if (f.norad === currentNorad) loadTrack(f.norad, trackHours);
         else loadSatPos(f.norad, f.name || f.norad);
       });
+      restoreLastSelection(data.favorites);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  // ===== 恢复上次选中卫星 (优先: 跟踪中的 → localStorage 的) =====
+  let restoredOnce = false;  // 只自动恢复一次, 之后尊重用户手动取消选中的状态
+  function restoreLastSelection(favorites) {
+    if (currentNorad || restoredOnce) return;
+    // 1) 刷新时后端仍在跟踪的卫星
+    if (pendingRestoreNorad != null) {
+      const hit = favorites.find(f => String(f.norad) === String(pendingRestoreNorad));
+      if (hit) {
+        restoredOnce = true;
+        const n = pendingRestoreNorad;
+        pendingRestoreNorad = null;
+        selectSatellite(Number(n), hit.name || n);
+        return;
+      }
+    }
+    pendingRestoreNorad = null;
+    // 2) 上次页面选中的卫星
+    try {
+      const last = JSON.parse(localStorage.getItem('lastSat') || 'null');
+      if (last && last.norad != null) {
+        const hit = favorites.find(f => String(f.norad) === String(last.norad));
+        if (hit) {
+          restoredOnce = true;
+          selectSatellite(hit.norad, hit.name || last.norad);
+        }
+      }
     } catch (e) { /* 忽略 */ }
   }
 
@@ -152,14 +201,60 @@
         map.removeLayer(satPosMarkers[norad].label);
       }
       const circle = L.circleMarker([data.sub_lat, data.sub_lon], {
-        radius: 5, color: '#facc15', fillColor: '#facc15', fillOpacity: 0.8
+        radius: 5, color: '#facc15', fillColor: '#facc15', fillOpacity: 0.8,
+        className: 'sat-dot-clickable'
       }).addTo(map);
       const label = L.marker([data.sub_lat, data.sub_lon], {
-        icon: L.divIcon({ className: 'sat-label', html: name, iconSize: [90, 16] })
+        icon: L.divIcon({ className: 'sat-label clickable', html: name, iconSize: [90, 16] })
       }).addTo(map);
+      // 点击地图上的卫星圆点/名称 → 直接切换选中
+      const pick = () => selectSatellite(norad, name);
+      circle.on('click', pick);
+      label.on('click', pick);
       satPosMarkers[norad] = { circle, label };
     } catch (e) { /* 忽略 */ }
   }
+
+  // ===== 卫星实时搜索下拉 (名称/编号模糊匹配, 点击即收藏) =====
+  const favSearchRes = $('favSearchRes');
+  let searchTimer = null;
+
+  function hideSearchRes() { favSearchRes.style.display = 'none'; }
+
+  async function doLiveSearch(q) {
+    try {
+      const res = await fetch('/api/sat/search?q=' + encodeURIComponent(q));
+      const data = await res.json();
+      if (!data.ok) { hideSearchRes(); return; }
+      const matches = data.satellites || [];
+      if (matches.length === 0) {
+        favSearchRes.innerHTML = '<div class="res-empty">未找到匹配卫星</div>';
+        favSearchRes.style.display = 'block';
+        return;
+      }
+      favSearchRes.innerHTML = matches.map(s =>
+        `<div class="res-item" data-norad="${s.norad}"><span class="r-name">${s.name || s.norad}</span><span class="r-norad">NORAD ${s.norad}</span></div>`
+      ).join('');
+      favSearchRes.style.display = 'block';
+      favSearchRes.querySelectorAll('.res-item').forEach(el => {
+        el.addEventListener('click', () => {
+          addFav(el.dataset.norad);
+          $('favSearch').value = '';
+          hideSearchRes();
+        });
+      });
+    } catch (e) { hideSearchRes(); }
+  }
+
+  $('favSearch').addEventListener('input', () => {
+    const q = $('favSearch').value.trim();
+    clearTimeout(searchTimer);
+    if (!q) { hideSearchRes(); return; }
+    searchTimer = setTimeout(() => doLiveSearch(q), 250);
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.fav-search-wrap')) hideSearchRes();
+  });
 
   // ===== 添加收藏 =====
   $('btnFavAdd').onclick = async () => {
@@ -205,10 +300,11 @@
   }
 
   // ===== 加载卫星轨迹 (星下点) =====
-  async function loadTrack(norad, hours) {
+  async function loadTrack(norad, hours, seq) {
     try {
       const res = await fetch('/api/sat/track/' + norad + '?hours=' + (hours || 24) + '&step=120');
       const data = await res.json();
+      if (seq !== undefined && seq !== selectSeq) return;  // 已切换到其他卫星, 丢弃旧响应
       if (!data.ok || !data.points || data.points.length === 0) return;
       const raw = data.points.map(p => [p.lat, p.lon]);
       if (trackLayers[norad]) {
@@ -243,16 +339,21 @@
     Object.keys(trackLayers).forEach(k => { if (trackLayers[k]) map.removeLayer(trackLayers[k]); });
     trackLayers = {};
   }
+  let selectSeq = 0;  // 切换令牌: 快速连续切换时旧请求响应直接丢弃, 防止旧数据覆盖新状态
   async function selectSatellite(norad, name) {
+    const seq = ++selectSeq;
     // 切换卫星时移除旧轨迹
     clearAllTracks();
     currentNorad = norad;
     currentSatName = name || norad;
+    try { localStorage.setItem('lastSat', JSON.stringify({ norad, name: currentSatName })); } catch (e) { /* 忽略 */ }
     // 高亮列表
     document.querySelectorAll('.fav-item').forEach(el => el.classList.remove('active'));
     const items = document.querySelectorAll('.fav-item');
     items.forEach(el => {
-      if (el.querySelector('.del').dataset.norad === norad) el.classList.add('active');
+      // 太阳/月球等天体项无 .del 按钮, 需判空
+      const delBtn = el.querySelector('.del');
+      if (delBtn && String(delBtn.dataset.norad) === String(norad)) el.classList.add('active');
     });
     // 移除该卫星的实时位置圆圈, 显示 24 小时轨迹
     if (satPosMarkers[norad]) {
@@ -260,10 +361,10 @@
       map.removeLayer(satPosMarkers[norad].label);
       delete satPosMarkers[norad];
     }
-    loadTrack(norad, trackHours);
-    loadRadar(norad);
-    loadPasses(norad);
-    startInfoPoll(norad);
+    loadTrack(norad, trackHours, seq);
+    loadRadar(norad, seq);
+    loadPasses(norad, seq);
+    startInfoPoll(norad, seq);
     // 点击卫星: 开启跟随, 地图中心移至卫星
     followSat = true;
     map.once('dragstart', () => { followSat = false; });  // 手动拖动时取消跟随
@@ -273,6 +374,7 @@
     currentNorad = null;
     currentSatName = null;
     followSat = false;
+    try { localStorage.removeItem('lastSat'); } catch (e) { /* 忽略 */ }
     $('satInfo').innerHTML = '<div class="row"><span class="k">未选择卫星</span></div>';
     if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
     if (coverageLayer) { map.removeLayer(coverageLayer); coverageLayer = null; }
@@ -280,6 +382,7 @@
     if (infoTimer) clearInterval(infoTimer);
     $('passList').innerHTML = '';
     drawRadar([]);
+    radarPass = null;
     // 移除所有轨迹, 恢复实时位置圆圈
     Object.keys(trackLayers).forEach(k => { if (trackLayers[k]) map.removeLayer(trackLayers[k]); });
     trackLayers = {};
@@ -305,12 +408,13 @@
   }
 
   // ===== 卫星信息轮询 =====
-  function startInfoPoll(norad) {
+  function startInfoPoll(norad, seq) {
     if (infoTimer) clearInterval(infoTimer);
     const update = async () => {
       try {
         const res = await fetch('/api/sat/position/' + norad);
         const data = await res.json();
+        if (seq !== undefined && seq !== selectSeq) return;  // 已切换, 丢弃旧响应
         if (!data.ok) return;
         $('satInfo').innerHTML = `
           <div class="row"><span class="k">方位角</span><span class="v">${data.azimuth}°</span></div>
@@ -319,11 +423,17 @@
           <div class="row"><span class="k">可见</span><span class="v" style="color:${data.visible ? '#4ade80' : '#ef4444'}">${data.visible ? '是' : '否'}</span></div>`;
         // 覆盖范围圆 (跟随星下点)
         drawCoverage(data.sub_lat, data.sub_lon, data.alt_km);
-        // 地图上当前星下点 (黄色 + 卫星名称标签)
+        // 地图上当前星下点 (脉冲高亮标记 + 卫星名称标签, 与未选中的黄色圆点区分)
         if (currentMarker) map.removeLayer(currentMarker);
         const labelText = currentSatName || '卫星';
         currentMarker = L.layerGroup([
-          L.circleMarker([data.sub_lat, data.sub_lon], { radius: 7, color: '#facc15', fillColor: '#facc15', fillOpacity: 1 }),
+          L.marker([data.sub_lat, data.sub_lon], {
+            icon: L.divIcon({
+              className: 'cur-sat-wrap',
+              html: '<span class="cur-sat-pulse"></span><span class="cur-sat-dot"></span>',
+              iconSize: [18, 18], iconAnchor: [9, 9]
+            })
+          }),
           L.marker([data.sub_lat, data.sub_lon], {
             icon: L.divIcon({ className: 'sat-label', html: labelText, iconSize: [100, 16] })
           })
@@ -331,7 +441,7 @@
         // 跟随卫星: 地图中心平滑移动到当前星下点
         if (followSat) map.panTo([data.sub_lat, data.sub_lon], { animate: true, duration: 0.5 });
         // 雷达图当前点
-        drawRadar(radarPoints, { az: data.azimuth, el: data.elevation });
+        drawRadar(radarPoints, { az: data.azimuth, el: data.elevation }, radarPass);
       } catch (e) { /* 忽略 */ }
     };
     update();
@@ -339,10 +449,13 @@
   }
 
   // ===== 过境列表 =====
-  async function loadPasses(norad) {
+  async function loadPasses(norad, seq) {
     try {
+      // 加载占位提示
+      $('passList').innerHTML = '<div style="font-size:12px;color:#64748b;padding:4px 2px">加载过境中…</div>';
       const res = await fetch('/api/sat/passes/' + norad + '?hours=24&min_elev=0');
       const data = await res.json();
+      if (seq !== undefined && seq !== selectSeq) return;  // 已切换, 丢弃旧响应
       if (!data.ok) return;
       const list = $('passList');
       list.innerHTML = '<div style="font-size:13px;color:#7dd3fc;margin-bottom:8px">未来过境</div>';
@@ -358,17 +471,19 @@
   }
 
   // ===== 雷达图 =====
-  async function loadRadar(norad) {
+  async function loadRadar(norad, seq) {
     try {
-      const res = await fetch('/api/sat/radar/' + norad + '?minutes=30&step=30');
+      const res = await fetch('/api/sat/radar/' + norad);
       const data = await res.json();
+      if (seq !== undefined && seq !== selectSeq) return;  // 已切换, 丢弃旧响应
       if (!data.ok) return;
       radarPoints = data.points;
-      drawRadar(radarPoints);
+      radarPass = data.pass;
+      drawRadar(radarPoints, null, radarPass);
     } catch (e) { /* 忽略 */ }
   }
 
-  function drawRadar(points, current) {
+  function drawRadar(points, current, passInfo) {
     const canvas = $('radar');
     const ctx = canvas.getContext('2d');
     const W = canvas.width, H = canvas.height;
@@ -419,6 +534,18 @@
       ctx.beginPath();
       ctx.arc(x, y, 5, 0, Math.PI * 2);
       ctx.fill();
+    }
+    // 过境 AOS 起点标记 (外圈, el≈0)
+    if (passInfo && passInfo.aos_az !== undefined) {
+      const x = cx + R * Math.sin(passInfo.aos_az * Math.PI / 180);
+      const y = cy - R * Math.cos(passInfo.aos_az * Math.PI / 180);
+      ctx.fillStyle = '#22c55e';
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('AOS', x, y - 10);
     }
   }
 
@@ -522,66 +649,171 @@
 
   // ===== 云台跟踪 =====
   $('btnTrack').onclick = async () => {
-    if (!currentNorad) { toast('请先选择卫星'); return; }
-    if (!tracking) {
-      try {
-        const res = await fetch('/api/sat/track/' + currentNorad, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-        const data = await res.json();
-        if (data.ok && data.tracking) {
-          tracking = true;
-          $('btnTrack').textContent = '停止跟踪';
-          $('btnTrack').classList.add('tracking');
-          toast('开始跟踪 ' + currentNorad);
-        } else if (data.ok && data.detail) {
-          // 俯仰归零中: 后台正在开环把俯仰降到 0°, 完成后自动开始跟踪
-          tracking = true;
-          $('btnTrack').textContent = '停止跟踪';
-          $('btnTrack').classList.add('tracking');
-          toast(data.detail);
-        } else toast('跟踪失败: ' + (data.detail || ''));
-      } catch (e) { toast('跟踪失败'); }
-    } else {
+    if (tracking) {
+      // 正在跟踪 (卫星或月球): 一律停止, 无需 currentNorad
       try {
         await fetch('/api/sat/track/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-        tracking = false;
-        $('btnTrack').textContent = '开始跟踪';
-        $('btnTrack').classList.remove('tracking');
-        toast('已停止跟踪');
+        const targetLabel = { moon: '月球', sun: '太阳' }[trackingTarget];
+        trackingTarget = 'sat';
+        setTrackingUI(false);
+        stopMoonInfo();
+        toast(targetLabel ? `已停止${targetLabel}跟踪` : '已停止跟踪');
       } catch (e) { toast('停止失败'); }
+      return;
     }
+    if (!currentNorad) { toast('请先选择卫星'); return; }
+    try {
+      const res = await fetch('/api/sat/track/' + currentNorad, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (data.ok && data.tracking) {
+        trackingTarget = 'sat';
+        stopMoonInfo();
+        setTrackingUI(true);
+        toast('开始跟踪 ' + currentNorad);
+      } else if (data.ok && data.detail) {
+        // 俯仰归零中: 后台正在开环把俯仰降到 0°, 完成后自动开始跟踪
+        trackingTarget = 'sat';
+        stopMoonInfo();
+        setTrackingUI(true);
+        toast(data.detail);
+      } else toast('跟踪失败: ' + (data.detail || ''));
+    } catch (e) { toast('跟踪失败'); }
   };
 
+  // ===== 月球/太阳跟踪 (通用天体) =====
+  let trackingTarget = 'sat';   // 'sat' | 'moon' | 'sun'
+  let moonTimer = null;
+
+  function stopMoonInfo() { if (moonTimer) { clearInterval(moonTimer); moonTimer = null; } }
+
+  function setTrackingUI(on, label) {
+    tracking = on;
+    $('btnTrack').textContent = on ? (label || '停止跟踪') : '开始跟踪';
+    $('btnTrack').classList.toggle('tracking', on);
+    $('btnMoonTrack').classList.toggle('active', on && trackingTarget === 'moon');
+    $('btnSunTrack').classList.toggle('active', on && trackingTarget === 'sun');
+  }
+
+  const CELESTIAL = {
+    moon: { emoji: '🌙', name: '月球', endpoint: '/api/moon/position' },
+    sun:  { emoji: '☀️', name: '太阳', endpoint: '/api/sun/position' },
+  };
+
+  async function pollCelestialInfo(target) {
+    try {
+      const c = CELESTIAL[target];
+      const r = await fetch(c.endpoint);
+      const d = await r.json();
+      if (!d.ok) return;
+      $('satInfo').innerHTML =
+        `<div class="row"><span class="k">目标</span><span class="v">${c.emoji} ${c.name}</span></div>` +
+        `<div class="row"><span class="k">方位角</span><span class="v">${d.azimuth}°</span></div>` +
+        `<div class="row"><span class="k">仰角</span><span class="v">${d.elevation}°</span></div>` +
+        `<div class="row"><span class="k">距离</span><span class="v">${Math.round(d.distance)} km</span></div>` +
+        `<div class="row"><span class="k">状态</span><span class="v" style="color:${d.visible ? '#4ade80' : '#facc15'}">${d.visible ? '地平线上' : '地平线下'}</span></div>`;
+    } catch (e) { /* 忽略 */ }
+  }
+
+  async function startCelestialTracking(target) {
+    try {
+      const c = CELESTIAL[target];
+      const res = await fetch('/api/sat/track/' + target, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (!data.ok) { toast(c.name + '跟踪失败: ' + (data.detail || '')); return; }
+      trackingTarget = target;
+      setTrackingUI(true, `停止跟踪 ${c.emoji}`);
+      stopMoonInfo();
+      pollCelestialInfo(target);
+      moonTimer = setInterval(() => pollCelestialInfo(target), 2000);
+      toast(data.detail || `开始${c.name}跟踪`);
+    } catch (e) { toast(c.name + '跟踪失败'); }
+  }
+
+  function bindCelestialButton(btnId, target) {
+    $(btnId).onclick = () => {
+      if (tracking && trackingTarget === target) {
+        // 已在跟踪该天体 -> 停止
+        fetch('/api/sat/track/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        trackingTarget = 'sat';
+        setTrackingUI(false);
+        stopMoonInfo();
+        toast('已停止' + CELESTIAL[target].name + '跟踪');
+      } else {
+        startCelestialTracking(target);
+      }
+    };
+  }
+  bindCelestialButton('btnMoonTrack', 'moon');
+  bindCelestialButton('btnSunTrack', 'sun');
+
   // ===== 刷新后恢复跟踪状态 (后端线程仍在跟踪) =====
+  let pendingRestoreNorad = null;  // 跟踪中的卫星, 待收藏列表渲染后恢复选中视图
   async function restoreTracking() {
     try {
       const r = await fetch('/api/sat/track/status');
       const d = await r.json();
-      if (!d.ok) return;
+      if (!d.ok) return false;
+      if (d.tracking && CELESTIAL[d.norad]) {
+        // 恢复月球/太阳跟踪状态
+        const c = CELESTIAL[d.norad];
+        trackingTarget = d.norad;
+        setTrackingUI(true, `停止跟踪 ${c.emoji}`);
+        stopMoonInfo();
+        pollCelestialInfo(d.norad);
+        moonTimer = setInterval(() => pollCelestialInfo(d.norad), 2000);
+        toast(c.name + '跟踪继续进行中');
+        return true;  // 天体跟踪, 不自动选卫星
+      }
       if (d.tracking && d.norad) {
         tracking = true;
         $('btnTrack').textContent = '停止跟踪';
         $('btnTrack').classList.add('tracking');
-        // 恢复选中的卫星视图 (轨迹/雷达/信息)
-        if (!currentNorad) {
-          const favs = document.querySelectorAll('.fav-item');
-          for (const el of favs) {
-            if (el.querySelector('.del').dataset.norad === String(d.norad)) {
-              selectSatellite(Number(d.norad), el.querySelector('.name').textContent);
-              break;
-            }
-          }
-        }
+        // 记录待恢复卫星, 收藏列表渲染完成后自动选中 (原实现遍历空 DOM 无法恢复)
+        pendingRestoreNorad = d.norad;
         toast('跟踪继续进行中 (' + d.norad + ')');
+        return true;
       }
-    } catch (e) { /* 忽略 */ }
+      return false;
+    } catch (e) { return false; }
   }
 
   // ===== 初始化 =====
   initMap();
   bindTrackDurBtns();
-  loadFavorites();
   loadEncCal();
-  restoreTracking();
+  // 先确认后端跟踪状态 (决定恢复哪颗卫星), 再渲染收藏列表并恢复选中
+  (async () => {
+    await restoreTracking();
+    loadFavorites();
+  })();
   setInterval(loadFavorites, 30000);
   setInterval(pollEncoderCal, 500);
+
+  // ===== 地图云台方向指示线（IIFE 闭包内，直接访问 map / obsMarker） =====
+  let ptzDirLine = null, ptzArrow = null;
+  function ptzDirEnd(lat, lon, bearingDeg, distKm) {
+    const R = 6371, brng = bearingDeg * Math.PI / 180;
+    const d = distKm / R, r1 = lat * Math.PI / 180, r2 = lon * Math.PI / 180;
+    const lt = Math.asin(Math.sin(r1) * Math.cos(d) + Math.cos(r1) * Math.sin(d) * Math.cos(brng));
+    const ln = r2 + Math.atan2(Math.sin(brng) * Math.sin(d) * Math.cos(r1), Math.cos(d) - Math.sin(r1) * Math.sin(lt));
+    return [lt * 180 / Math.PI, ln * 180 / Math.PI];
+  }
+  window.updatePtzDir = function(panDeg) {
+    if (!map || !obsMarker || isNaN(panDeg)) { console.log('ptzDir skip', {obsMarker, map, panDeg}); return; }
+    const pos = obsMarker.getLatLng(), o = [pos.lat, pos.lng];
+    const end = ptzDirEnd(o[0], o[1], panDeg, 1500);
+    const back = ptzDirEnd(end[0], end[1], (panDeg + 180) % 360, 30);
+    const l1 = ptzDirEnd(back[0], back[1], (panDeg + 270) % 360, 15);
+    const l2 = ptzDirEnd(back[0], back[1], (panDeg + 90) % 360, 15);
+    if (!ptzDirLine) {
+      console.log('ptzDir create', {obs: o, end, panDeg});
+      ptzDirLine = L.polyline([o, end], { color: '#ff4444', weight: 5, opacity: 1 }).addTo(map);
+      ptzArrow = L.polygon([end, l1, l2], { color: '#ff4444', fillColor: '#ff4444', fillOpacity: 1, weight: 0 }).addTo(map);
+    } else {
+      ptzDirLine.setLatLngs([o, end]);
+      ptzArrow.setLatLngs([end, l1, l2]);
+    }
+    ptzDirLine.bringToFront();
+    ptzArrow.bringToFront();
+  };
 })();
