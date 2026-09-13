@@ -1,3 +1,4 @@
 flask==3.1.0
 waitress==3.0.2
 pyserial==3.5
+websockets==17.1

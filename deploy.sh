@@ -44,8 +44,8 @@ $SSH "echo ok" >/dev/null 2>&1 || fail "无法连接服务器, 请检查网络/I
 
 # ---------- 2. 同步后端代码 ----------
 info "同步后端代码 -> $REMOTE_DIR/backend/"
-$SCP "$BACKEND_DIR/main.py" "$BACKEND_DIR/auth.py" "$BACKEND_DIR/satellite.py" \
-     "$BACKEND_DIR/pelco.py" "$BACKEND_DIR/requirements.txt" \
+$SCP "$BACKEND_DIR/main.py" "$BACKEND_DIR/auth.py" "$BACKEND_DIR/satellite.py" "$BACKEND_DIR/streaming.py" \
+     "$BACKEND_DIR/pelco.py" "$BACKEND_DIR/rotctld_server.py" "$BACKEND_DIR/ws_server.py" "$BACKEND_DIR/requirements.txt" \
      "$USER@$HOST:$REMOTE_DIR/backend/"
 
 # ---------- 3. 同步前端静态文件 ----------
@@ -56,6 +56,19 @@ $SCP "$FRONTEND_DIR/index.html" "$FRONTEND_DIR/satellite.js" "$FRONTEND_DIR/eart
 # ---------- 4. 安装依赖 (仅 requirements 变化时) ----------
 info "检查并安装 Python 依赖 ..."
 $SSH "cd $REMOTE_DIR/backend && $REMOTE_DIR/venv/bin/pip install -q -r requirements.txt 2>/dev/null || echo '依赖安装跳过/失败'" || true
+
+# 4.1 确保 sgp4 为 C 加速版 (纯 Python 版慢几十倍; C 扩展为 vallado_cpp*.so)
+info "确认 sgp4 C 加速版 ..."
+SGP4_CHECK='import glob,os,sgp4; d=os.path.dirname(sgp4.__file__); exit(0 if glob.glob(os.path.join(d,"*.so")) else 1)'
+if $SSH "$REMOTE_DIR/venv/bin/python -c '$SGP4_CHECK'" 2>/dev/null; then
+    info "sgp4 C 加速已就绪 ✓"
+else
+    warn "sgp4 缺少 C 加速, 尝试升级安装 ..."
+    $SSH "$REMOTE_DIR/venv/bin/pip install -q -U sgp4" \
+        && $SSH "$REMOTE_DIR/venv/bin/python -c '$SGP4_CHECK'" \
+        && info "sgp4 C 加速安装成功 ✓" \
+        || warn "sgp4 C 加速安装失败, 性能将受影响"
+fi
 
 # ---------- 5. 重启服务 ----------
 info "重启 $SERVICE 服务 ..."

@@ -7,19 +7,29 @@
 """
 from __future__ import annotations
 
+import gzip
 import json
+import logging
 import os
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 import serial
-from flask import Flask, jsonify, request, send_from_directory, session
+from flask import Flask, Response, jsonify, request, send_from_directory, session
+from flask.sessions import SecureCookieSessionInterface
 from waitress import serve
+import ws_server  # WebSocket 实时推送 (与 SSE 并行, 前端 WS 优先/SSE 降级)
 
 from pelco import PelcoD
 import satellite
+import streaming
 import auth
+import rotctld_server
 
 # ---------- 配置 ----------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -102,7 +112,30 @@ app.secret_key = os.environ["PTZ_SECRET_KEY"]
 def _is_public(path: str) -> bool:
     return (path.startswith("/api/auth/")
             or path == "/api/encoder"
-            or path.startswith("/api/encoder/"))
+            or path.startswith("/api/encoder/")
+            or path == "/api/wsurl")  # 仅返回 WS 端点字符串, 无敏感数据, 供前端未登录也可探测
+
+
+# WebSocket 握手鉴权: 复用 Flask session 签名验签 Cookie, 防止未登录连接收实时数据
+_ws_signer = None
+def _ws_check_auth(cookie_str: str) -> bool:
+    global _ws_signer
+    if not cookie_str:
+        return False
+    if _ws_signer is None:
+        _ws_signer = SecureCookieSessionInterface().get_signing_serializer(app)
+    sess_val = None
+    for part in cookie_str.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == app.config.get("SESSION_COOKIE_NAME", "session"):
+            sess_val = v
+            break
+    if not sess_val:
+        return False
+    try:
+        return bool((_ws_signer.loads(sess_val) or {}).get("user"))
+    except Exception:  # noqa: BLE001 签名无效/过期
+        return False
 
 
 @app.before_request
@@ -640,7 +673,7 @@ def _reset_loop(tilt_s: float):
     水平低速(0x08)找光电精确停 0°, 俯仰全速(0x20)按时长归零, 两轴同时驱动。
     水平以光电触发为锚点精确停 0°, 俯仰按时长归零。
     """
-    global _zero_evt_angle, _last_pan_cont
+    global _zero_evt_angle, _last_pan_cont, _display_pan
     _zero_evt.clear()
     reset_start_t = time.time()   # 复位开始时间, 用于忽视复位前的旧光电事件
     zero = _encoder_cal.get("zero_angle")
@@ -777,6 +810,8 @@ def _reset_loop(tilt_s: float):
     if zero_angle_found is not None:
         with _encoder_lock:
             _encoder_state["pan"] = 0.0
+            _encoder_state["dpan"] = 0.0
+            _display_pan = 0.0
             _encoder_state["cont_angle"] = 0.0
             _encoder_state["pan_time"] = time.time()
     with _encoder_lock:
@@ -794,6 +829,63 @@ sat_tracker.tilt_speed = get_cfg("tilt_speed_dps")
 sat_tracker.tilt_up_speed = get_cfg("tilt_up_speed_dps")
 sat_tracker.tilt_down_speed = get_cfg("tilt_down_speed_dps")
 sat_tracker.accel_time = get_cfg("accel_time")
+
+
+# ---------- SkyRoof / Hamlib rotctld 桥接 (TCP 4533) ----------
+# 供 SkyRoof 等 rotctld 协议客户端直接连接操控云台
+rotctld_srv = None  # 实际实例在 __main__ 中创建并赋值
+_rotck_move_lock = threading.Lock()
+_rotck_move_th = None
+_rotck_target = None              # 最新待执行目标 (az, el), 游标式更新不丢弃
+_rotck_stop_ev = threading.Event()  # 置位 = 取消进行中的 move_to
+
+
+def _rotck_get_position():
+    """rotctld 查询位置: 返回 dict {pan, tilt} (以编码器换算的物理角为准)"""
+    pan, tilt, _ = _sat_get_position()
+    return {"pan": pan, "tilt": tilt}
+
+
+def _rotck_move_worker():
+    """游标式循环: 逐个执行最新目标, 不丢命令; 取消置位即停
+    (原实现: move_to 为阻塞式, 上一个线程活着时新命令被静默丢弃,
+     SkyRoof 高频 P 命令下云台会一直朝旧目标转 = "不可控转动")"""
+    global _rotck_target
+    while True:
+        with _rotck_move_lock:
+            tgt = _rotck_target
+            _rotck_target = None
+        if tgt is None or _rotck_stop_ev.is_set():
+            break
+        az, el = tgt
+        try:
+            sat_tracker.move_to(az, el, cancel_ev=_rotck_stop_ev)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rotctld] move_to failed: {e}", flush=True)
+
+
+def _rotck_set_position(az, el):
+    """rotctld P 命令: 记录最新目标, 后台线程逐个执行, 立即返回不阻塞协议连接。
+    网页卫星/天体跟踪激活时屏蔽 SkyRoof 控制 (以网页为准), 避免两控制源抢云台"""
+    global _rotck_move_th, _rotck_target
+    if sat_tracker.is_tracking():
+        print(f"[rotctld] P {az} {el} 被屏蔽: 网页跟踪进行中", flush=True)
+        return
+    _rotck_stop_ev.clear()
+    with _rotck_move_lock:
+        _rotck_target = (az, el)
+        if _rotck_move_th is None or not _rotck_move_th.is_alive():
+            _rotck_move_th = threading.Thread(
+                target=_rotck_move_worker, daemon=True
+            )
+            _rotck_move_th.start()
+
+
+def _rotck_stop_motion():
+    """rotctld S 命令: 取消进行中的 move_to + 发停止帧, 云台立即停
+    (原实现只发停止帧, 阻塞式 move_to 线程继续驱动 = 复位后仍朝旧方向转)"""
+    _rotck_stop_ev.set()
+    _sat_send_dir("stop")
 
 
 def _hold_loop(direction: str, check_limit: bool = True):
@@ -857,21 +949,75 @@ def err(msg: str, code: int = 400) -> tuple:
     return jsonify({"ok": False, "detail": msg}), code
 
 
+# ---------- gzip 压缩 (弱 WiFi 链路下传输量减 ~75%, 页面加载明显提速) ----------
+_GZIP_TYPES = {"text/html", "text/css", "application/javascript", "text/javascript",
+               "application/json", "text/plain", "image/svg+xml"}
+
+
+@app.after_request
+def _gzip_response(resp):
+    """对文本类 200 响应做 gzip; SSE 流(image/event-stream)与已压缩格式跳过"""
+    if resp.mimetype == "text/event-stream":
+        return resp
+    if (resp.status_code != 200 or resp.mimetype not in _GZIP_TYPES
+            or "gzip" in (resp.headers.get("Content-Encoding") or "")):
+        return resp
+    if resp.direct_passthrough:  # send_from_directory 的文件流, 允许读入内存
+        resp.direct_passthrough = False
+    data = resp.get_data()
+    if len(data) < 1024:
+        return resp
+    resp.set_data(gzip.compress(data, 6))
+    resp.headers["Content-Encoding"] = "gzip"
+    resp.headers["Content-Length"] = str(len(resp.get_data()))
+    resp.headers.add("Vary", "Accept-Encoding")
+    return resp
+
+
 # ---------- 页面 ----------
 @app.route("/")
 def index():
-    return send_from_directory(FRONTEND_DIR, "index.html")
+    resp = send_from_directory(FRONTEND_DIR, "index.html")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 # 天地图瓦片代理: 绕过 WAF 浏览器 UA 封禁 (服务器直连, 无浏览器请求头)
+# 带磁盘缓存: 瓦片几乎不变, 命中直接回本地 (J1900 首屏提速 + 天地图故障时仍可显示)
 _TDT_KEY = "d0ca322ca9f024d7673cd4d91e588290"
 _TDT_LAYERS = {"cva": "cva_w", "vec": "vec_w"}
+_TDT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "tdt")
+# 瓦片几乎不变: 长缓存 immutable → 浏览器端二次打开地图瓦片直接命中本地缓存,
+# 不再经电力猫+隧道弱链路逐片重传 (服务器端仍有磁盘缓存, 首传命中即回)
+_TILE_HEADERS = {"Content-Type": "image/png",
+                 "Cache-Control": "public, max-age=2592000, immutable"}
+
+
+def _tile_response(data: bytes):
+    return Response(data, 200, _TILE_HEADERS)
+
 
 @app.route("/tdt/<layer>/<int:z>/<int:x>/<int:y>")
 def tdt_tile_proxy(layer: str, z: int, x: int, y: int):
+    """天地图瓦片代理: 磁盘缓存命中直接回(下次同瓦片免回源), 未命中抓取并落盘。"""
+    data = _fetch_tile(layer, z, x, y)
+    if data is None:
+        return err("tile proxy failed"), 502
+    return _tile_response(data)
+
+
+def _fetch_tile(layer: str, z: int, x: int, y: int) -> bytes | None:
+    """抓取单张天地图瓦片: 先查服务器磁盘缓存, 未命中再从天地图拉取并写入缓存。
+    供代理与后台预热线程共用 → 大量瓦片预存到 J1900, 任意访问从服务器分发。"""
     tdt_layer = _TDT_LAYERS.get(layer)
     if not tdt_layer:
-        return err("bad layer"), 404
+        return None
+    cache_path = os.path.join(_TDT_CACHE_DIR, layer, str(z), str(x), f"{y}.png")
+    try:
+        with open(cache_path, "rb") as f:  # 已缓存, 直接服务器分发
+            return f.read()
+    except OSError:
+        pass
     url = (f"https://t0.tianditu.gov.cn/{tdt_layer}/wmts"
            f"?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0"
            f"&LAYER={layer}&STYLE=default&TILEMATRIXSet=w"
@@ -881,37 +1027,168 @@ def tdt_tile_proxy(layer: str, z: int, x: int, y: int):
         req = urllib.request.Request(url, headers={"User-Agent": ""})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = resp.read()
-        return data, 200, {"Content-Type": "image/png", "Cache-Control": "public, max-age=86400"}
     except Exception:
-        return err("tile proxy failed"), 502
+        return None
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            f.write(data)
+    except Exception:  # noqa: BLE001
+        pass  # 缓存写入失败不影响使用
+    return data
+
+
+def _prewarm_tiles():
+    """后台预热: 把观测站周边常用缩放层级(3~8)的天地图瓦片(底图+标注)预先存到 J1900,
+    使外网/内网访问时地图瓦片直接从服务器分发, 首打开即命中, 无需现场回源天地图。"""
+    import math
+    try:
+        obs = satellite.get_observer()
+        lat, lon = obs["lat"], obs["lon"]
+    except Exception:  # noqa: BLE001
+        lat, lon = 39.9, 116.4
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for z in range(3, 9):   # zoom 3~8
+            n = 1 << z
+            xt = int((lon + 180.0) / 360.0 * n)
+            lat_r = math.radians(lat)
+            yt = int((1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n)
+            for x in range(max(0, xt - 1), min(n, xt + 2)):
+                for y in range(max(0, yt - 1), min(n, yt + 2)):
+                    ex.submit(_fetch_tile, "vec", z, x, y)
+                    ex.submit(_fetch_tile, "cva", z, x, y)
+    print("[tdt] 瓦片预热完成")
 
 
 @app.route("/<path:filename>")
 def static_files(filename: str):
-    """服务前端静态文件 (如 satellite.js)"""
-    return send_from_directory(FRONTEND_DIR, filename)
+    """服务前端静态文件 (如 satellite.js)。
+    静态资源加长缓存 immutable → 外网二次访问命中浏览器缓存, 不再经 Tunnel 重复慢传;
+    HTML 走 no-cache 协商, 配合 ?v= 版本号即时更新而不过度缓存。
+    """
+    resp = send_from_directory(FRONTEND_DIR, filename)
+    if filename.endswith((".js", ".css", ".jpg", ".jpeg", ".png", ".gif",
+                          ".svg", ".ico", ".woff", ".woff2")):
+        resp.headers["Cache-Control"] = "public, max-age=604800, immutable"
+    else:
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.route("/api/wsurl")
+def ws_url():
+    """告知前端 WS 推送端点。
+    内网 IP → ws://IP:PORT (独立端口 8092, 直连);
+    外网域名 → wss://<host>/ws (同一域名 /ws 路径, 同源 cookie 可通过握手鉴权;
+     需在 Cloudflare Tunnel 把 <host>/ws 转发到 192.168.31.70:8092;
+     未配置时前端连不上会自动回退 SSE, 功能不中断。)
+    """
+    host = request.host.split(":")[0]
+    wport = os.getenv("PTZ_WS_PORT", "8092")
+    ws_server.ensure_started(wport, _ws_frame_factory, _ws_check_auth)
+    if host.replace(".", "").isdigit():   # 内网 IP
+        return jsonify(ok=True, ws=f"ws://{host}:{wport}")
+    # 外网域名: 走同一域名 /ws 路径 (Cloudflare 把 /ws 路径转发到 8092, 同源 cookie 可鉴权)
+    return jsonify(ok=True, ws=f"wss://{host}/ws")
 
 
 # ---------- 状态 ----------
+def _status_payload() -> dict:
+    """串口/系统状态 (供 /api/status 与 SSE 状态帧共用)"""
+    ser = get_serial()
+    # ESP32/UDP 在线状态: 编码器数据 2s 内有更新则在线
+    enc_time = _encoder_state.get("time", 0.0)
+    udp_online = (time.time() - enc_time) < 2.0
+    return {"port": SERIAL_PORT, "baud": BAUD_RATE,
+            "address": PTZ_ADDRESS, "open": ser.is_open,
+            "paused": is_paused(),
+            "resetting": is_resetting(),
+            "udp_online": udp_online,
+            "tangle_warn": _encoder_state.get("tangle_warn"),
+            "pan_speed_dps": get_cfg("pan_speed_dps"),
+            "tilt_speed_dps": get_cfg("tilt_speed_dps"),
+            "pan_range": [get_cfg("pan_min"), get_cfg("pan_max")],
+            "tilt_range": [get_cfg("tilt_min"), get_cfg("tilt_max")]}
+
+
 @app.route("/api/status")
 def status():
     try:
-        ser = get_serial()
-        # ESP32/UDP 在线状态: 编码器数据 2s 内有更新则在线
-        enc_time = _encoder_state.get("time", 0.0)
-        udp_online = (time.time() - enc_time) < 2.0
-        return ok({"port": SERIAL_PORT, "baud": BAUD_RATE,
-                   "address": PTZ_ADDRESS, "open": ser.is_open,
-                   "paused": is_paused(),
-                   "resetting": is_resetting(),
-                   "udp_online": udp_online,
-                   "tangle_warn": _encoder_state.get("tangle_warn"),
-                   "pan_speed_dps": get_cfg("pan_speed_dps"),
-                   "tilt_speed_dps": get_cfg("tilt_speed_dps"),
-                   "pan_range": [get_cfg("pan_min"), get_cfg("pan_max")],
-                   "tilt_range": [get_cfg("tilt_min"), get_cfg("tilt_max")]})
+        return ok(_status_payload())
     except Exception as e:  # noqa: BLE001
         return err(str(e), 500)
+
+
+# ---------- SSE 推流 (一条连接替代前端多路轮询) ----------
+def _stream_state(norad, celestial):
+    """状态帧: 串口状态 + 云台位置 + 目标位置 + 编码器角度 (卫星/天体)
+    (角度并入 SSE, 内网/外网统一一条流实时更新; 不再依赖前端快轮询)
+    """
+    frame = {"status": _status_payload(), "pos": tracker.get()}
+    # 编码器角度 (与 /api/encoder GET 同构): dpan/pan/tilt 供前端实时刷新方向线与角度
+    with _encoder_lock:
+        enc = dict(_encoder_state)
+    enc["zero_angle"] = _encoder_cal.get("zero_angle")
+    enc["now"] = time.time()
+    enc["rejected"] = _last_rejected
+    with tracker.lock:
+        enc["tilt"] = tracker.tilt
+    frame["enc"] = enc
+    if celestial in ("moon", "sun"):
+        pos = satellite.moon_position() if celestial == "moon" else satellite.sun_position()
+        if pos:
+            frame["sat"] = pos
+            frame["sat_kind"] = celestial
+    elif norad:
+        pos = satellite.satellite_position(norad)
+        if pos:
+            frame["sat"] = pos
+            frame["sat_kind"] = "sat"
+    # 地图常显: 月球/太阳星下点 (晨昏线由前端按太阳星下点自行绘制)
+    try:
+        m = satellite.moon_position()
+        s = satellite.sun_position()
+        frame["cel"] = {
+            "moon": {"sub_lat": m.get("sub_lat"), "sub_lon": m.get("sub_lon"), "visible": m.get("visible")} if m else None,
+            "sun": {"sub_lat": s.get("sub_lat"), "sub_lon": s.get("sub_lon"), "visible": s.get("visible")} if s else None,
+        }
+    except Exception:  # noqa: BLE001
+        frame["cel"] = None
+    # SkyRoof / rotctld 客户端连接状态 (前端顶部指示灯)
+    frame["rotctld_connected"] = bool(
+        rotctld_srv is not None and rotctld_srv.connected
+    )
+    return frame
+
+
+def _stream_serial():
+    with _serial_log_lock:
+        return {"log": list(_serial_log)}
+
+
+def _stream_favorites():
+    return {"favorites": satellite.get_favorites()}
+
+
+def _stream_photocalib():
+    with _photo_calib_lock:
+        return {"running": _photo_calib["running"], "phase": _photo_calib["phase"],
+                "result": _photo_calib.get("result")}
+
+
+@app.route("/api/stream")
+def stream():
+    """SSE 推流: state(1s) / serial(0.8s) / favorites(30s) / photocalib(1s)
+    目标位置由 query 参数指定: norad=<编号> 或 celestial=moon|sun
+    """
+    norad = request.args.get("norad") or None
+    celestial = request.args.get("celestial") or None
+    return streaming.make_stream_response({
+        "state": (lambda: _stream_state(norad, celestial), streaming.STATE_INTERVAL),
+        "serial": (_stream_serial, streaming.SERIAL_INTERVAL),
+        "favorites": (_stream_favorites, streaming.FAVORITES_INTERVAL),
+        "photocalib": (_stream_photocalib, streaming.PHOTOCALIB_INTERVAL),
+    })
 
 
 # ---------- 设置 ----------
@@ -1410,12 +1687,35 @@ def sun_pos():
 
 @app.route("/api/sat/radar/<norad>", methods=["GET"])
 def sat_radar(norad: str):
-    """返回未来一段时间内的方位角/仰角序列 (用于雷达图, 缓存版)"""
-    minutes = float(request.args.get("minutes", 30))
+    """雷达图迹线: 返回所选过境的完整 AOS→LOS 方位/仰角序列。
+
+    默认自动选择: 卫星当前在过境 → 本次过境; 否则 → 下一次过境。
+    前端可用 ?aos=..&los=.. 指定任意过境 (过境列表点击选择)。
+    """
     step = float(request.args.get("step", 30))
-    points = satellite.compute_radar_cached(norad, minutes, step)
+    aos_q = request.args.get("aos")
+    los_q = request.args.get("los")
+    if aos_q and los_q:
+        aos, los = float(aos_q), float(los_q)
+        meta = {"aos": aos, "los": los, "aos_az": 0, "los_az": 0}
+        # 尝试从过境缓存补齐该过境的方位/峰值元数据
+        for p in satellite.compute_passes_cached(norad):
+            if abs(p["aos"] - aos) < 5:
+                meta = p
+                break
+    else:
+        cp = satellite.current_pass_info(norad)
+        if cp:
+            aos, los, meta = cp["aos"], cp["los"], cp
+        else:
+            passes = satellite.compute_passes_cached(norad)
+            if not passes:
+                return ok({"points": [], "pass": None})
+            meta = passes[0]
+            aos, los = meta["aos"], meta["los"]
+    points = satellite.compute_radar_pass(norad, aos, los, step)
     now = time.time()
-    return ok({"points": [p for p in points if p["t"] >= now]})
+    return ok({"points": [p for p in points if p["t"] >= now], "pass": meta})
 
 
 @app.route("/api/sat/favorites", methods=["GET"])
@@ -1632,6 +1932,38 @@ _prev_syn_zero_pan = None
 _load_encoder_cal()
 
 
+_display_pan = None   # 平滑显示角 (EMA): 每个 UDP 包都更新但抑制抖动/毛刺, 供前端方向线/大数字
+
+def _update_display_pan(pan, trusted=False):
+    """显示角平滑更新: 被滤波接受/拒绝的包都调用, 但:
+    - 360° 回绕感知 (delta 归一化到 ±180)
+    - >15°物理 (60°ESP) 毛刺: 保持不动
+    - trusted=True (滤波接受的可信角): alpha=0.8 直接收敛, 空闲时无抖动
+    - trusted=False (被拒包/运动中原始包): 抖动带 (4~40°ESP) 用 alpha=0.12 强抑制;
+      大位移 (>10°物理) 才快跟 alpha=0.5, 保证复位/转向时仍实时跟随
+    """
+    global _display_pan
+    if pan is None:
+        return
+    if _display_pan is None:
+        _display_pan = pan
+    else:
+        delta = (pan - _display_pan + 180.0) % 360.0 - 180.0
+        if abs(delta) > 60.0:
+            return   # 大毛刺 (单包被拒/干扰), 保持
+        if trusted:
+            if abs(delta) < 0.05:
+                return
+            _display_pan += delta * 0.8
+        else:
+            if abs(delta) < 0.5:
+                return   # 微抖 (<0.13°物理), 不动
+            a = 0.5 if abs(delta) > 40.0 else 0.12
+            _display_pan += delta * a
+    with _encoder_lock:
+        _encoder_state["dpan"] = _display_pan
+
+
 def _process_encoder_data(angle, raw):
     """处理 AS5600 编码器数据, 更新水平轴位置 (HTTP POST 和 UDP 共用)
     直接使用 ESP32 固件 unwrap 累积角度 (多圈展开), 计算 pan = (angle - zero) % 360。
@@ -1651,6 +1983,7 @@ def _process_encoder_data(angle, raw):
             pass
     # --- 智能滤波 ---
     # 未标定时不做滤波
+    trusted_accept = True
     if pan is not None and not _enc_data_filter(angle, now):
         global _last_rejected
         global _rej_stable_cnt, _rej_stable_angle, _rej_stable_t
@@ -1674,14 +2007,16 @@ def _process_encoder_data(angle, raw):
             _rej_stable_cnt = 0
             _rej_stable_angle = None
             _last_rejected = False
+            trusted_accept = False   # 恢复值仍可能带噪声: 走慢速平滑, 不猛拉 dpan
             print(f"[filter] 连续稳定确认, 编码器基准恢复: {angle:.2f}", flush=True)
             # fall through 走下方接受路径更新位置
         else:
             # 尝试检测并修正 AS5600 振荡后的 ±360° unwrap 偏移 (偏 90° 根因)
             _detect_unwrap_error(angle, now)
-            # 丢弃: 只更新时间 (保活), 不更新位置
+            # 丢弃: 只更新时间 (保活), 显示角经平滑更新 (抑制抖动/毛刺, 防方向线乱指)
             with _encoder_lock:
                 _encoder_state["time"] = now
+            _update_display_pan(pan)
             return
     if pan is None:
         # 未标定 (zero_angle=None) 时 pan/cont_angle 无意义, 但 angle/raw 仍需上报
@@ -1691,6 +2026,7 @@ def _process_encoder_data(angle, raw):
             _encoder_state["raw"] = raw
             _encoder_state["cont_angle"] = None
             _encoder_state["pan"] = None
+            _encoder_state["dpan"] = None
             _encoder_state["pan_time"] = 0.0
             _encoder_state["tangle_warn"] = None
         return
@@ -1719,6 +2055,7 @@ def _process_encoder_data(angle, raw):
             if warn:
                 print(f"[tangle] {warn}", flush=True)
             _encoder_state["tangle_warn"] = warn
+    _update_display_pan(pan, trusted=trusted_accept)   # 接受路径: 正常接受=可信角直接收敛; 漂移恢复=慢速平滑
     with tracker.lock:
         if tracker._moving is not None:
             direction, start = tracker._moving
@@ -1837,6 +2174,8 @@ def encoder_get():
     st["zero_angle"] = _encoder_cal.get("zero_angle")
     st["now"] = time.time()
     st["rejected"] = _last_rejected
+    with tracker.lock:
+        st["tilt"] = tracker.tilt   # 俯仰航位推算角, 供前端 250ms 快轮询实时显示
     return ok(st)
 
 
@@ -2007,7 +2346,7 @@ def encoder_photocalib():
 @app.route("/api/encoder/setzero", methods=["POST"])
 def encoder_setzero():
     """手动设置当前位置为物理 0° 基准角"""
-    global _last_pan_cont
+    global _last_pan_cont, _display_pan
     with _encoder_lock:
         angle = _encoder_state.get("angle")
     if angle is None:
@@ -2022,8 +2361,10 @@ def encoder_setzero():
     # (此前仅更新 zero_angle, pan 靠下一包 UDP 才刷新, 离线时永不更新)
     with _encoder_lock:
         _encoder_state["pan"] = 0.0
+        _encoder_state["dpan"] = 0.0
         _encoder_state["cont_angle"] = 0.0
         _encoder_state["pan_time"] = time.time()
+    _display_pan = 0.0
     with tracker.lock:
         tracker.pan = 0.0
         tracker._pan_base = 0.0
@@ -2032,7 +2373,30 @@ def encoder_setzero():
 
 
 if __name__ == "__main__":
+
+    def _ws_frame_factory(target: dict):
+        """WebSocket 推送帧表, 与 SSE 各帧完全对齐"""
+        norad = target.get("norad") if target else None
+        celestial = target.get("celestial") if target else None
+        return [
+            (streaming.STATE_INTERVAL, "state",
+             lambda n=norad, c=celestial: _stream_state(n, c)),
+            (streaming.SERIAL_INTERVAL, "serial", _stream_serial),
+            (streaming.FAVORITES_INTERVAL, "favorites", _stream_favorites),
+            (streaming.PHOTOCALIB_INTERVAL, "photocalib", _stream_photocalib),
+        ]
+
     satellite.start_background_jobs()  # 后台: TLE 6h / 过境 10min
+    # 后台预热地图瓦片到服务器: 外网/内网访问时从 J1900 分发, 无需回源天地图
+    threading.Thread(target=_prewarm_tiles, daemon=True, name="tdt-prewarm").start()
     port = int(os.getenv("PTZ_PORT", "8090"))
+    # 启动 rotctld 桥接服务器 (SkyRoof / Hamlib 客户端, 默认 4533)
+    rotctld_srv = rotctld_server.RotctldServer(
+        _rotck_get_position, _rotck_set_position, _rotck_stop_motion,
+        host="0.0.0.0", port=int(os.getenv("ROTCTLD_PORT", "4533")),
+    )
+    rotctld_srv.start()
+    # 启动 WebSocket 实时推送 (默认 8092; 与 waitress 并存, 前端 WS 优先/SSE 降级)
+    ws_server.start(int(os.getenv("PTZ_WS_PORT", "8092")), _ws_frame_factory, _ws_check_auth)
     print(f"YD3040 云台控制服务启动: http://0.0.0.0:{port}")
-    serve(app, host="0.0.0.0", port=port, threads=8)
+    serve(app, host="0.0.0.0", port=port, threads=16)  # SSE 长连接各占 1 线程, 需留余量

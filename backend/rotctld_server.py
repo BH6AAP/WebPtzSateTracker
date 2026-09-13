@@ -15,13 +15,21 @@ from typing import Callable, Optional
 
 _logger = logging.getLogger(__name__)
 
+# 活动连接计数: 只要存在一条已建立且未关闭的 rotctld 连接就算"已连接"
+# (不依赖"最后收到命令时间", 否则 SkyRoof 长时间不主动发指令会被误判离线)
+_active_conns = 0
+_conn_lock = threading.Lock()
+
 
 class RotctldHandler(socketserver.StreamRequestHandler):
     timeout = 10.0
     _last_command_time = 0.0
 
     def setup(self):
+        global _active_conns
         super().setup()
+        with _conn_lock:
+            _active_conns += 1
         _logger.info("[rotctld] new connection: %s", self.client_address)
 
     def handle(self):
@@ -127,6 +135,9 @@ class RotctldHandler(socketserver.StreamRequestHandler):
         )
 
     def finish(self):
+        global _active_conns
+        with _conn_lock:
+            _active_conns = max(0, _active_conns - 1)
         _logger.info("[rotctld] disconnected: %s", self.client_address)
 
 
@@ -151,7 +162,8 @@ class RotctldServer:
 
     @property
     def connected(self):
-        return time.time() - RotctldHandler._last_command_time < 30.0
+        with _conn_lock:
+            return _active_conns > 0
 
     def start(self):
         class _Handler(RotctldHandler):
