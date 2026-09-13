@@ -167,12 +167,14 @@
   .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .dot.on { background: #22c55e; } .dot.off { background: #ef4444; }
 
-  /* ===== 中间 (地图 + 收藏列表) ===== */
-  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .map-wrap { flex: 2; position: relative; }
+  /* ===== 中间 (地图) ===== */
+  .main { flex: 1; min-width: 0; position: relative; }
+  .map-wrap { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
   #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #0b1220; }
-  .fav-bar { flex: 1; background: #1e293b; border-top: 1px solid #334155; overflow-y: auto; padding: 10px; }
-  .fav-bar h3 { font-size: 13px; color: #7dd3fc; margin-bottom: 8px; }
+
+  /* ===== 右列 (已收藏卫星) ===== */
+  .fav-panel { width: 310px; min-width: 310px; background: #1e293b; border-left: 1px solid #334155; overflow-y: auto; padding: 10px; }
+  .fav-panel h3 { font-size: 13px; color: #7dd3fc; margin-bottom: 8px; }
   .fav-item {
     display: flex; align-items: center; justify-content: space-between;
     padding: 8px 10px; border-radius: 8px; background: #0f172a; margin-bottom: 6px; cursor: pointer;
@@ -196,8 +198,8 @@
   .fav-search-res .res-item .r-norad { font-size: 11px; color: #64748b; }
   .fav-search-res .res-empty { padding: 8px 10px; font-size: 12px; color: #94a3b8; }
 
-  /* ===== 右侧 (卫星信息 + 雷达图 + 跟踪) ===== */
-  .right { width: 340px; min-width: 340px; background: #1e293b; border-left: 1px solid #334155; overflow-y: auto; padding: 14px; }
+  /* ===== 左列 (卫星信息 + 雷达图 + 跟踪) ===== */
+  .right { width: 310px; min-width: 310px; background: #1e293b; border-right: 1px solid #334155; overflow-y: auto; padding: 14px; }
   .right h3 { font-size: 14px; color: #7dd3fc; margin-bottom: 10px; }
   .sat-info { background: #0f172a; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
   .sat-info .row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
@@ -219,7 +221,8 @@
   }
   .dur-btn.active { background: #0ea5e9; border-color: #0ea5e9; color: #fff; }
   .pass-list { margin-top: 12px; }
-  .pass-item { background: #0f172a; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; font-size: 12px; }
+  .pass-item { background: #0f172a; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; font-size: 12px; cursor: pointer; }
+  .pass-item.selected { background: #1e3a8a; outline: 1px solid #0ea5e9; }
   .pass-item .t { color: #94a3b8; }
 
   .toast {
@@ -228,6 +231,10 @@
     font-size: 13px; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 9999;
   }
   .toast.show { opacity: 1; }
+
+  /* 移动端专属元素: 桌面隐藏 */
+  .fav-actions { display: none; }
+  .radar-float { display: none; }
 
   /* 卫星名称标签 */
   .sat-label {
@@ -270,21 +277,49 @@
     .topbar { font-size: 11px; padding: 0 8px; }
     .topbar-left { gap: 8px; }
 
-    /* 主体全屏: 地图 + 收藏列表 */
-    .app { margin-top: 36px; height: calc(100vh - 36px); }
-    .main { width: 100%; position: relative; }
-    .map-wrap { flex: 1; }
-    /* 收藏列表: 覆盖地图底部的可折叠面板 */
-    .fav-bar {
-      position: absolute; left: 0; right: 0; bottom: 0; z-index: 900;
-      max-height: 40%; background: #1e293b; border-top: 1px solid #334155;
-      border-radius: 14px 14px 0 0; transition: max-height .25s;
+    /* 主体全屏: 地图, 从状态栏到卫星列表顶部 */
+    .app { margin-top: 36px; height: calc(100vh - 36px); flex-direction: column; }
+    .main { width: 100%; position: relative; flex: 1; }
+    .map-wrap { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+
+    /* 移动端快捷操作行: 开始跟踪/紧急刹车/复位, 固定在屏幕底部 (不遮挡卫星列表) */
+    .fav-actions {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 1100;
+      display: flex; gap: 8px; padding: 8px 10px;
+      padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+      background: rgba(15, 23, 42, .95); border-top: 1px solid #334155;
     }
-    .fav-bar.collapsed { max-height: 40px; overflow: hidden; }
-    .fav-bar h3 { cursor: pointer; margin-bottom: 4px; }
-    .fav-add { display: none; }
-    .fav-bar.collapsed .fav-add { display: flex; }
-    .fav-bar.collapsed .fav-item { display: none; }
+    .fav-action {
+      flex: 1; padding: 12px 4px; border: none; border-radius: 8px;
+      font-size: 14px; font-weight: bold; color: #fff; cursor: pointer;
+    }
+    .fav-action.track { background: #16a34a; }
+    .fav-action.track.tracking { background: #dc2626; }
+    .fav-action.brake { background: #dc2626; }
+    .fav-action.brake.paused { background: #22c55e; }
+    .fav-action.home { background: #f59e0b; }
+
+    /* 卫星列表: 真实底部抽屉 (不再覆盖地图), 地图默认尺寸 = 状态栏到列表顶部 */
+    .fav-panel {
+      position: relative; left: auto; right: auto; bottom: auto;
+      width: 100%; min-width: 0;
+      height: 42vh; max-height: 42vh; min-height: 0;
+      flex: 0 0 auto;
+      background: #1e293b; border-left: none;
+      border-top: 1px solid #334155; border-radius: 0;
+      padding: 10px 10px 60px;
+      overflow-y: auto; -webkit-overflow-scrolling: touch;
+    }
+    .fav-panel h3 { cursor: pointer; margin-bottom: 4px; }
+
+    /* 移动端浮动雷达图: 地图右上角, 点击卫星后显示 */
+    .radar-float {
+      display: none; position: absolute; top: 10px; right: 10px; z-index: 1000;
+      background: rgba(15,23,42,.92); border: 1px solid #334155; border-radius: 10px;
+      padding: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.5);
+    }
+    .radar-float.show { display: block; }
+    .radar-float canvas { display: block; width: 140px; height: 140px; }
 
     /* 云台控制: 底部抽屉 (默认收起) */
     .sidebar {
@@ -300,6 +335,7 @@
     /* 卫星详情: 右侧抽屉 */
     .right {
       position: fixed; right: 0; top: 36px; bottom: 0; z-index: 1000;
+      border-right: none; border-left: 1px solid #334155;
       box-shadow: -2px 0 12px rgba(0,0,0,.5);
       transform: translateX(100%); transition: transform .25s;
     }
@@ -307,12 +343,12 @@
 
     /* 浮动操作按钮 */
     .open-btn {
-      display: block; position: fixed; left: 12px; bottom: 14px; top: auto;
+      display: block; position: fixed; left: 12px; bottom: 70px; top: auto;
       width: 52px; height: 52px; border-radius: 50%; font-size: 13px; z-index: 1300;
     }
     .open-btn.active { background: #0ea5e9; }
     .right-btn {
-      display: block; position: fixed; right: 12px; bottom: 14px; top: auto;
+      display: block; position: fixed; right: 12px; bottom: 70px; top: auto;
       width: 52px; height: 52px; border-radius: 50%; font-size: 13px; z-index: 1300;
     }
     .right-btn.active { background: #0ea5e9; }
@@ -468,11 +504,26 @@
   <button id="openBtn" class="open-btn">控制</button>
   <button id="rightBtn" class="right-btn">详情</button>
 
-  <!-- 中间: 地图 + 收藏列表 -->
+  <!-- 中间: 地图 -->
   <main class="main">
-    <div class="map-wrap"><div id="map"></div></div>
-    <div class="fav-bar" id="favBar">
+    <div class="map-wrap">
+      <div id="map"></div>
+      <!-- 移动端浮动雷达图: 点击卫星后显示在地图右上角 (桌面隐藏) -->
+      <div class="radar-float" id="radarFloat">
+        <canvas id="radarFloatCv" width="140" height="140"></canvas>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右列: 已收藏卫星 -->
+  <aside class="fav-panel" id="favBar">
       <h3>已收藏卫星</h3>
+      <!-- 移动端快捷操作行: 开始跟踪 / 紧急刹车 / 复位 (桌面隐藏) -->
+      <div class="fav-actions" id="favActions">
+        <button class="fav-action track" id="btnTrackM">开始跟踪</button>
+        <button class="fav-action brake" id="btnPauseM">紧急刹车</button>
+        <button class="fav-action home" id="btnHomeM">复位</button>
+      </div>
       <button class="fav-item moon-item" id="btnSunTrack" style="width:100%;display:flex;align-items:center;gap:8px;margin-bottom:10px;background:#7c2d12;">
         <span style="font-size:18px;">☀️</span>
         <span style="flex:1;text-align:left;">
@@ -495,10 +546,9 @@
         <div class="fav-search-res" id="favSearchRes"></div>
       </div>
       <div id="favList"></div>
-    </div>
-  </main>
+  </aside>
 
-  <!-- 右侧: 卫星信息 + 雷达图 + 跟踪 -->
+  <!-- 左列: 卫星信息 + 雷达图 + 跟踪 (桌面位于地图左侧) -->
   <aside class="right">
     <h3>卫星信息</h3>
     <div class="sat-info" id="satInfo">
@@ -651,24 +701,25 @@ $('btnHome').onclick = async () => {
   }
 };
 
-// ===== 串口监控 =====
+// 移动端快捷操作行: 委托到桌面按钮逻辑
+$('btnTrackM').onclick = () => $('btnTrack').click();
+$('btnPauseM').onclick = () => $('btnPause').click();
+$('btnHomeM').onclick = () => $('btnHome').click();
+
+// ===== 串口监控 (数据由 SSE 推流提供) =====
 let lastLogLen = 0;
-async function pollSerialLog() {
-  try {
-    const res = await fetch('/api/seriallog');
-    const data = await res.json();
-    if (!data.ok) return;
-    const log = data.log;
-    if (log.length === lastLogLen) return;
-    lastLogLen = log.length;
-    const box = $('serialLog');
-    if (log.length === 0) { box.innerHTML = '<div class="empty">暂无数据</div>'; return; }
-    box.innerHTML = log.map(e =>
-      `<div class="row"><span class="t">${e.time}</span>` +
-      `<span class="dir ${e.dir === 'TX' ? 'tx' : 'rx'}">${e.dir}</span>` +
-      `<span class="${e.dir === 'TX' ? 'tx' : 'rx'}">${e.hex}</span></div>`).join('');
-    box.scrollTop = box.scrollHeight;
-  } catch (e) { /* 忽略 */ }
+function renderSerialLog(data) {
+  if (!data) return;
+  const log = data.log;
+  if (log.length === lastLogLen) return;
+  lastLogLen = log.length;
+  const box = $('serialLog');
+  if (log.length === 0) { box.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+  box.innerHTML = log.map(e =>
+    `<div class="row"><span class="t">${e.time}</span>` +
+    `<span class="dir ${e.dir === 'TX' ? 'tx' : 'rx'}">${e.dir}</span>` +
+    `<span class="${e.dir === 'TX' ? 'tx' : 'rx'}">${e.hex}</span></div>`).join('');
+  box.scrollTop = box.scrollHeight;
 }
 $('btnClear').onclick = () => { lastLogLen = 0; $('serialLog').innerHTML = '<div class="empty">暂无数据</div>'; };
 
@@ -851,6 +902,12 @@ function updatePauseBtn(paused) {
   const btn = $('btnPause');
   if (paused) { btn.classList.add('paused'); btn.textContent = '已刹车 · 点击恢复'; }
   else { btn.classList.remove('paused'); btn.textContent = '紧急刹车'; }
+  // 同步移动端快捷按钮
+  const btm = $('btnPauseM');
+  if (btm) {
+    btm.classList.toggle('paused', paused);
+    btm.textContent = paused ? '已刹车·恢复' : '紧急刹车';
+  }
 }
 $('btnPause').onclick = async () => {
   // 紧急刹车: 立即停止持续转动/卫星跟踪, 发送停止帧并重置推算位置; 已刹车则恢复控制
@@ -863,108 +920,93 @@ $('btnPause').onclick = async () => {
   } catch (e) { toast('刹车失败'); }
 };
 
-// ===== 状态检测 =====
-async function checkStatus() {
-  try {
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    if (data.ok) {
-      $('dot').className = 'dot on';
-      $('statusText').textContent = `已连接 ${data.port} @ ${data.baud}`;
-      updatePauseBtn(data.paused);
-      // 更新顶部串口状态
-      $('serialDot').className = 'dot on';
-      $('serialText').textContent = `${data.port} @ ${data.baud}`;
-      // 更新 SkyRoof 连接状态
-      $('rotctldDot').className = data.rotctld_connected ? 'dot on' : 'dot off';
-      $('rotctldText').textContent = data.rotctld_connected ? 'SkyRoof 已连接' : 'SkyRoof 离线';
-      // 复位完成 -> 恢复按钮控制 (不再依赖固定超时)
-      if (_resetInProgress && !data.resetting) _resetDone();
-    } else {
-      $('dot').className = 'dot off';
-      $('statusText').textContent = '串口未连接: ' + (data.detail || '');
-      $('serialDot').className = 'dot off';
-      $('serialText').textContent = 'RS485 未连接';
-      $('rotctldDot').className = 'dot off';
-      $('rotctldText').textContent = 'SkyRoof 离线';
-    }
-  } catch (e) {
+// ===== 状态渲染 (数据由 SSE 推流提供, 断线由 onStreamDown 处理) =====
+function renderStatus(data) {
+  if (data) {
+    $('dot').className = 'dot on';
+    $('statusText').textContent = `已连接 ${data.port} @ ${data.baud}`;
+    updatePauseBtn(data.paused);
+    // 更新顶部串口状态
+    $('serialDot').className = 'dot on';
+    $('serialText').textContent = `${data.port} @ ${data.baud}`;
+    // 更新 SkyRoof 连接状态
+    $('rotctldDot').className = data.rotctld_connected ? 'dot on' : 'dot off';
+    $('rotctldText').textContent = data.rotctld_connected ? 'SkyRoof 已连接' : 'SkyRoof 离线';
+    // 复位完成 -> 恢复按钮控制 (不再依赖固定超时)
+    if (_resetInProgress && !data.resetting) _resetDone();
+  } else {
     $('dot').className = 'dot off';
-    $('statusText').textContent = '无法连接后端';
+    $('statusText').textContent = '串口未连接';
     $('serialDot').className = 'dot off';
-    $('serialText').textContent = 'RS485 离线';
+    $('serialText').textContent = 'RS485 未连接';
     $('rotctldDot').className = 'dot off';
     $('rotctldText').textContent = 'SkyRoof 离线';
   }
 }
 
-// ===== 位置轮询 =====
-async function pollPosition() {
-  try {
-    const res = await fetch('/api/position');
-    const data = await res.json();
-    if (data.ok) {
-      $('panVal').innerHTML = data.pan + '<span class="unit">°</span>';
-      $('tiltVal').innerHTML = data.tilt + '<span class="unit">°</span>';
-      // 用航位推算方向作兜底（编码器在线时由 pollEncoder 覆盖）
-      window.updatePtzDir(Number(data.pan));
-    }
-  } catch (e) { /* 忽略 */ }
+function onStreamDown() {
+  // SSE 断线: 显示后端离线 (EventSource 会自动重连, 重连成功后恢复)
+  $('dot').className = 'dot off';
+  $('statusText').textContent = '无法连接后端';
+  $('serialDot').className = 'dot off';
+  $('serialText').textContent = 'RS485 离线';
+  $('rotctldDot').className = 'dot off';
+  $('rotctldText').textContent = 'SkyRoof 离线';
 }
 
-// ===== AS5600 编码器数值显示 =====
+// ===== 位置渲染 =====
+function renderPosition(data) {
+  // pan/tilt/方向线均由 SSE state 帧的 enc 字段实时刷新;
+  // 此处不再画方向线, 避免与 enc 更新交替覆盖导致来回乱指
+}
 
-// ===== AS5600 编码器数值显示 =====
-async function pollEncoder() {
-  try {
-    const res = await fetch('/api/encoder');
-    const data = await res.json();
-    // 在线判定: 3 秒内收到过 ESP32 数据 (time=后端收到最后一包的时间戳), 与 angle 是否有效无关
-    // 用后端返回的 now 在同一时钟域内比较, 避免浏览器/服务器时钟偏差导致误判离线
-    const fresh = data.ok && data.time && (data.now - data.time) < 3;
-    if (fresh) {
-      $('udpDot').className = 'dot on';
-      $('udpText').textContent = 'ESP32 在线';
-      $('encoderBar').style.display = 'flex';
-      $('encRaw').textContent = 'raw:' + (data.raw ?? '-');
-      const ang = (data.angle !== null && data.angle !== undefined) ? Number(data.angle).toFixed(1) + '°' : '-';
-      // angle 为滤波器过滤后的稳定值; 最近被丢弃/修正(干扰/反向毛刺)时标红提示
-      $('encAngle').textContent = 'ang:' + ang;
-      $('encAngle').style.color = data.rejected ? '#f87171' : '';
-      // pan 0~360°: 360° 与 0° 同位置 (光电零位), 显示为 0°
-      let panVal = (data.pan !== null && data.pan !== undefined) ? Number(data.pan) : NaN;
-      if (panVal >= 359.95) panVal = 0.0;
-      $('encPan').textContent = 'pan:' + (isNaN(panVal) ? '-' : panVal.toFixed(1) + '°');
+// ===== AS5600 编码器数值渲染 =====
+function renderEncoder(data) {
+  // 在线判定: 3 秒内收到过 ESP32 数据 (time=后端收到最后一包的时间戳), 与 angle 是否有效无关
+  // 用后端返回的 now 在同一时钟域内比较, 避免浏览器/服务器时钟偏差导致误判离线
+  const fresh = data && data.time && (data.now - data.time) < 3;
+  if (fresh) {
+    $('udpDot').className = 'dot on';
+    $('udpText').textContent = 'ESP32 在线';
+    $('encoderBar').style.display = 'flex';
+    $('encRaw').textContent = 'raw:' + (data.raw ?? '-');
+    const ang = (data.angle !== null && data.angle !== undefined) ? Number(data.angle).toFixed(1) + '°' : '-';
+    // angle 为滤波器过滤后的稳定值; 最近被丢弃/修正(干扰/反向毛刺)时标红提示
+    $('encAngle').textContent = 'ang:' + ang;
+    $('encAngle').style.color = data.rejected ? '#f87171' : '';
+    // pan 0~360°: 360° 与 0° 同位置 (光电零位), 显示为 0°
+    // 优先显示 dpan (每个 UDP 包都更新的显示角, 转动/复位时实时跟随);
+    // pan 为滤波可信角, 仅在 dpan 缺失时兜底 (未标定场景)
+    // 数据源: SSE state 帧 enc 字段 (0.4s 一帧, 内网/外网统一实时)
+    let panVal = (data.dpan !== null && data.dpan !== undefined) ? Number(data.dpan)
+                : ((data.pan !== null && data.pan !== undefined) ? Number(data.pan) : NaN);
+    if (panVal >= 359.95) panVal = 0.0;
+    $('encPan').textContent = 'pan:' + (isNaN(panVal) ? '-' : panVal.toFixed(1) + '°');
+    // 方向线死区: 角度变化 <0.05° 不重绘, 消除空闲微抖引起的线抖动
+    if (isNaN(window._lastDirPan) || Math.abs(panVal - window._lastDirPan) >= 0.05) {
+      window._lastDirPan = panVal;
       window.updatePtzDir(panVal);
-      // WiFi 信号强度 (rssi, dBm): 有值则显示并按强弱着色
-      const rssi = data.rssi;
-      if (rssi !== undefined && rssi !== null) {
+    }
+    // WiFi 信号强度 (rssi, dBm): 有值则显示并按强弱着色
+    const rssi = data.rssi;
+    if (rssi !== undefined && rssi !== null) {
         $('wifiItem').style.display = 'flex';
         const color = rssi >= -60 ? '#4ade80' : (rssi >= -70 ? '#facc15' : '#f87171');
         $('wifiText').innerHTML = '📶 <b style="color:' + color + ';">' + rssi + '</b>dBm';
       } else {
         $('wifiItem').style.display = 'none';
       }
-    } else {
-      $('udpDot').className = 'dot off';
-      $('udpText').textContent = 'ESP32 离线';
-      $('encAngle').style.color = '';
-      // 方向线由 pollPosition 的航位推算维持，此处不清除
-    }
-  } catch (e) {
+  } else {
     $('udpDot').className = 'dot off';
     $('udpText').textContent = 'ESP32 离线';
+    $('encAngle').style.color = '';
+    // 方向线由推流位置数据维持，此处不清除
   }
 }
 
-checkStatus();
 loadSettings();
-setInterval(checkStatus, 5000);
-setInterval(pollPosition, 500);
-setInterval(pollEncoder, 500);
-setInterval(pollSerialLog, 800);
 </script>
-<script src="satellite.js?v=22"></script>
+<script src="satellite.js?v=37" defer></script>
 <script>
 // ===== 登录状态管理器 =====
 (function () {
