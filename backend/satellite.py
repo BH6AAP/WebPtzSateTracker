@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from sgp4.api import Satrec, jday
@@ -23,6 +24,7 @@ FAVORITES_FILE = os.path.join(BASE_DIR, "sat_favorites.json")
 OBSERVER_FILE = os.path.join(BASE_DIR, "sat_observer.json")
 
 TLE_URLS = [
+    "https://db.satnogs.org/api/tle/?format=json",  # SatNOGS JSON (全量卫星, 首选)
     "https://www.amsat.org/tle/current/daily-bulletin.txt",
     "https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle",
 ]
@@ -212,6 +214,7 @@ def fetch_tle(force: bool = False) -> dict:
         with _tle_lock:
             _tle = merged
             _tle_fetch_time = time.time()
+        _bump_tle_version(merged)
         try:
             with open(TLE_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(merged, f, ensure_ascii=False)
@@ -223,6 +226,19 @@ def fetch_tle(force: bool = False) -> dict:
 def get_tle(norad_id: str) -> dict | None:
     with _tle_lock:
         return _tle.get(str(norad_id))
+
+
+# TLE 内容版本号: 内容变化时更新; 过境全量重算以此决定是否跳过 (J1900 省算力)
+_tle_version = 0
+_passes_tle_version = -1
+
+
+def _bump_tle_version(tle: dict) -> None:
+    """TLE 数据变化时递增版本号"""
+    global _tle_version
+    ver = hash(json.dumps(tle, sort_keys=True)) & 0x7FFFFFFF
+    if ver != _tle_version:
+        _tle_version = ver
 
 
 def get_all_tle() -> dict:
@@ -253,53 +269,120 @@ def _save_favorites():
         pass
 
 
+_fav_cache = {"time": 0.0, "data": []}   # 收藏列表计算结果缓存 (30s), 过境中的回溯细扫很贵
+FAV_CACHE_AGE = 30.0
+
+
 def get_favorites() -> list:
+    """收藏列表富数据: 直接读后台预计算缓存, 请求线程零计算、永不阻塞。
+    服务刚启动缓存尚未产出时返回空列表, 后台任务算完后经 favorites 帧推送。"""
+    with _fav_lock:
+        return list(_fav_cache["data"])
+
+
+_fav_refresh_lock = threading.Lock()
+
+
+def _compute_one_favorite(f: dict, now: float) -> tuple:
+    """计算单颗收藏卫星的富数据, 返回 (排序键, item)。"""
+    norad = str(f["norad"])
+    item = dict(f)
+    passes = compute_passes_cached(norad)  # 读后台过境缓存, 不现场计算
+    pos = satellite_position(norad, now)
+    cur_el = pos["elevation"] if pos else -90
+    if cur_el > 0:
+        # 正在过境: 用本次过境信息 (passes[0] 是下一次过境, 峰值/时间均不对)
+        cp = current_pass_info(norad, now)
+        if cp is not None:
+            item["next_aos"] = cp["aos"]
+            item["next_los"] = cp["los"]
+            item["max_el"] = round(cp["max_el"], 1)
+            item["aos_az"] = round(cp["aos_az"], 1)
+            item["los_az"] = round(cp["los_az"], 1)
+            item["status"] = "in_pass"
+            return (0, item)
+    if passes:
+        p = passes[0]
+        item["next_aos"] = p["aos"]
+        item["next_los"] = p["los"]
+        item["max_el"] = round(p["max_el"], 1)
+        item["aos_az"] = round(p["aos_az"], 1)
+        item["los_az"] = round(p["los_az"], 1)
+        if cur_el > 0:
+            item["status"] = "in_pass"
+            sort_key = 0  # 正在过境排最前
+        else:
+            item["status"] = "upcoming"
+            sort_key = max(1, p["aos"] - now)
+    else:
+        item["status"] = "no_pass"
+        item["next_aos"] = None
+        item["next_los"] = None
+        item["max_el"] = None
+        item["aos_az"] = None
+        item["los_az"] = None
+        sort_key = 1e12
+    return (sort_key, item)
+
+
+def _fav_sort_key(item: dict) -> float:
+    """缓存内排序键 (与 _compute_one_favorite 一致)"""
+    if item.get("status") == "in_pass":
+        return 0
+    aos = item.get("next_aos")
+    if aos:
+        return max(1, aos - time.time())
+    return 1e12
+
+
+def _compute_favorites() -> list:
+    """全量重算收藏列表富数据并写入缓存 (后台定时维护, 请求不触发)"""
     with _fav_lock:
         favs = list(_favorites)
     now = time.time()
     enriched = []
     for f in favs:
-        norad = str(f["norad"])
-        item = dict(f)
-        passes = compute_passes_cached(norad)  # 读后台缓存, 不现场计算
-        pos = satellite_position(norad, now)
-        cur_el = pos["elevation"] if pos else -90
-        if cur_el > 0:
-            # 正在过境: 用本次过境信息 (passes[0] 是下一次过境, 峰值/时间均不对)
-            cp = current_pass_info(norad, now)
-            if cp is not None:
-                item["next_aos"] = cp["aos"]
-                item["next_los"] = cp["los"]
-                item["max_el"] = round(cp["max_el"], 1)
-                item["aos_az"] = round(cp["aos_az"], 1)
-                item["los_az"] = round(cp["los_az"], 1)
-                item["status"] = "in_pass"
-                enriched.append((0, item))
-                continue
-        if passes:
-            p = passes[0]
-            item["next_aos"] = p["aos"]
-            item["next_los"] = p["los"]
-            item["max_el"] = round(p["max_el"], 1)
-            item["aos_az"] = round(p["aos_az"], 1)
-            item["los_az"] = round(p["los_az"], 1)
-            if cur_el > 0:
-                item["status"] = "in_pass"
-                sort_key = 0  # 正在过境排最前
-            else:
-                item["status"] = "upcoming"
-                sort_key = max(1, p["aos"] - now)
-        else:
-            item["status"] = "no_pass"
-            item["next_aos"] = None
-            item["next_los"] = None
-            item["max_el"] = None
-            item["aos_az"] = None
-            item["los_az"] = None
-            sort_key = 1e12
-        enriched.append((sort_key, item))
+        try:
+            sort_key, item = _compute_one_favorite(f, now)
+            enriched.append((sort_key, item))
+        except Exception:  # noqa: BLE001
+            continue
     enriched.sort(key=lambda x: x[0])
-    return [x[1] for x in enriched]
+    result = [x[1] for x in enriched]
+    _fav_cache["time"] = time.time()
+    _fav_cache["data"] = result
+    return result
+
+
+def _kick_fav_refresh() -> None:
+    """后台重算收藏列表 (并发去重: 已在重算则跳过)"""
+    if not _fav_refresh_lock.acquire(blocking=False):
+        return
+
+    def _bg():
+        try:
+            _compute_favorites()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _fav_refresh_lock.release()
+
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+def _favs_loop() -> None:
+    """后台持续预计算收藏列表富数据: 用户请求只读缓存, 零计算"""
+    time.sleep(2.0)  # 等 update_all_passes 预热过境缓存, 避免冷算重复 (每颗 ~1s)
+    try:
+        _compute_favorites()  # 启动立即产出缓存
+    except Exception:  # noqa: BLE001
+        pass
+    while True:
+        time.sleep(FAV_CACHE_AGE)  # 每 30s 全量刷新 (过境缓存命中, 成本低)
+        try:
+            _compute_favorites()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def add_favorite(norad_id: str) -> bool:
@@ -308,9 +391,23 @@ def add_favorite(norad_id: str) -> bool:
     if tle is None:
         return False
     with _fav_lock:
-        if norad_id not in [f["norad"] for f in _favorites]:
-            _favorites.append({"norad": norad_id, "name": tle.get("name", "")})
-            _save_favorites()
+        if norad_id in [f["norad"] for f in _favorites]:
+            return True
+        _favorites.append({"norad": norad_id, "name": tle.get("name", "")})
+        _save_favorites()
+    # 增量: 仅计算新收藏的这颗卫星并按排序插入缓存, 不触发全量重算 (省计算)
+    try:
+        sort_key, item = _compute_one_favorite({"norad": norad_id, "name": tle.get("name", "")}, time.time())
+        with _fav_lock:
+            cur = [x for x in _fav_cache["data"] if str(x["norad"]) != norad_id]
+            cur.append(item)
+            cur.sort(key=_fav_sort_key)
+            _fav_cache["time"] = time.time()
+            _fav_cache["data"] = cur
+    except Exception:  # noqa: BLE001
+        # 计算失败: 使缓存失效, 由后台任务补算
+        with _fav_lock:
+            _fav_cache["time"] = 0.0
     return True
 
 
@@ -322,6 +419,8 @@ def remove_favorite(norad_id: str) -> bool:
         _favorites = [f for f in _favorites if f["norad"] != norad_id]
         if len(_favorites) != before:
             _save_favorites()
+            # 增量: 直接从缓存移除该卫星 (不触发全量重算)
+            _fav_cache["data"] = [x for x in _fav_cache["data"] if str(x["norad"]) != norad_id]
             return True
     return False
 
@@ -340,6 +439,7 @@ def _load_tle_cache():
                 with _tle_lock:
                     _tle = data
                     _tle_fetch_time = time.time()
+                _bump_tle_version(data)
     except Exception:  # noqa: BLE001
         pass
 
@@ -483,12 +583,15 @@ def moon_position(when: float | None = None):
     mz = rm * math.sin(dec)
     c, s = math.cos(theta), math.sin(theta)
     moon_ecef = (mx * c + my * s, -mx * s + my * c, mz)
+    mn = math.sqrt(moon_ecef[0] ** 2 + moon_ecef[1] ** 2 + moon_ecef[2] ** 2)
     obs, obs_ecef = _observer_ecef()
     az, el = _ecef_to_azel(obs_ecef, moon_ecef, obs["lat"], obs["lon"])
     return {
         "azimuth": round(az, 1),
         "elevation": round(el, 1),
         "distance": round(dist, 0),
+        "sub_lat": round(math.degrees(math.asin(moon_ecef[2] / mn)), 2),
+        "sub_lon": round(math.degrees(math.atan2(moon_ecef[1], moon_ecef[0])), 2),
         "visible": el > 0,
     }
 
@@ -524,12 +627,15 @@ def sun_position(when: float | None = None):
     mz = dist * math.sin(dec)
     c, s = math.cos(theta), math.sin(theta)
     sun_ecef = (mx * c + my * s, -mx * s + my * c, mz)
+    sn = math.sqrt(sun_ecef[0] ** 2 + sun_ecef[1] ** 2 + sun_ecef[2] ** 2)
     obs, obs_ecef = _observer_ecef()
     az, el = _ecef_to_azel(obs_ecef, sun_ecef, obs["lat"], obs["lon"])
     return {
         "azimuth": round(az, 1),
         "elevation": round(el, 1),
         "distance": round(dist, 0),
+        "sub_lat": round(math.degrees(math.asin(sun_ecef[2] / sn)), 2),
+        "sub_lon": round(math.degrees(math.atan2(sun_ecef[1], sun_ecef[0])), 2),
         "visible": el > 0,
     }
 
@@ -783,21 +889,39 @@ def compute_radar_cached(norad_id: str, minutes: float, step: float) -> list:
     return _radar_cache.get(f"{norad_id}|{minutes}|{step}", _compute)
 
 
+def compute_radar_pass(norad_id: str, aos: float, los: float, step: float = 30.0) -> list:
+    """计算指定过境窗口 [aos, los] 内的方位/仰角迹线点 (雷达图完整 AOS→LOS 迹线)"""
+    points = []
+    t = aos
+    while t <= los:
+        pos = satellite_position(norad_id, t)
+        if pos:
+            points.append({"az": pos["azimuth"], "el": pos["elevation"], "t": t})
+        t += step
+    return points
+
+
 _pass_updating = threading.Lock()
 
 
 def update_all_passes() -> None:
-    """后台重算所有收藏卫星的过境列表"""
+    """后台重算所有收藏卫星的过境列表 (TLE 内容未变时跳过, 避免无谓的重算风暴)"""
+    global _passes_tle_version
+    if _passes_tle_version == _tle_version:
+        return  # TLE 没变, 已算过的过境列表仍然有效
     if not _pass_updating.acquire(blocking=False):
         return  # 上一次计算还没结束, 跳过本次
     try:
         with _fav_lock:
             favs = list(_favorites)
-        for f in favs:
-            try:
-                compute_passes_cached(str(f["norad"]), force=True)
-            except Exception:  # noqa: BLE001
-                pass
+        if not favs:
+            _passes_tle_version = _tle_version
+            return
+        # 并发预热: 每颗 48h 过境冷算 1~6s, 串行下重启后列表几十秒才就绪; 并行降约 4 倍
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for f in favs:
+                ex.submit(compute_passes_cached, str(f["norad"]), True)
+        _passes_tle_version = _tle_version
     finally:
         _pass_updating.release()
 
@@ -823,6 +947,8 @@ def start_background_jobs() -> None:
     threading.Thread(target=lambda: fetch_tle(force=True), daemon=True).start()
     # 启动后立即在后台算一次过境, 不阻塞服务启动
     threading.Thread(target=update_all_passes, daemon=True).start()
+    # 收藏列表富数据持续预计算: 用户请求只读缓存, 零计算
+    threading.Thread(target=_favs_loop, daemon=True).start()
 
 
 # ---------- 云台自动跟踪 ----------
@@ -933,16 +1059,20 @@ class SatelliteTracker:
         return (az - pan + 180) % 360 - 180
 
     def _drive(self, direction: str, seconds: float, ignore_stop: bool = False,
-               stop_ev=None):
+               stop_ev=None, cancel_ev=None):
         """在指定时间内持续发送同一方向指令 (每 100ms 一帧)
         ignore_stop=True 时不检查 _stop (用于独立的 move_to 线程)
         stop_ev: 跟踪线程私有停止标志 (None 时用 self._stop)
+        cancel_ev: 额外取消标志 (move_to 等独立线程可用它中断, 置位即发停止帧)
         """
         if seconds <= 0:
             return
         ev = stop_ev if stop_ev is not None else self._stop
         end = time.time() + seconds
         while time.time() < end:
+            if cancel_ev is not None and cancel_ev.is_set():
+                self.send_dir("stop")
+                return
             if not ignore_stop and ev.is_set():
                 return
             self.send_dir(direction)
@@ -951,8 +1081,10 @@ class SatelliteTracker:
             else:
                 ev.wait(0.1)
 
-    def move_to(self, target_pan=None, target_tilt=None, timeout: float = 15.0):
-        """移动到指定 pan/tilt 位置, 用于测试运动精度"""
+    def move_to(self, target_pan=None, target_tilt=None, timeout: float = 15.0,
+                cancel_ev=None):
+        """移动到指定 pan/tilt 位置, 用于测试运动精度
+        cancel_ev: 置位即停止 (供 rotctld 桥接等外部控制中断用)"""
         pos = self.get_position()
         if pos is None:
             return False
@@ -961,6 +1093,9 @@ class SatelliteTracker:
         pan_need = False
         pan_dir = None
         pan_sec = 0.0
+        if cancel_ev is not None and cancel_ev.is_set():
+            self.send_dir("stop")
+            return False
         if target_pan is not None:
             daz = self._pan_delta(float(target_pan), pan)
             if abs(daz) > threshold:
@@ -985,11 +1120,11 @@ class SatelliteTracker:
             return True
         both = min(pan_sec, tilt_sec)
         if both > 0.05 and pan_need and tilt_need:
-            self._drive(tilt_dir + pan_dir, both, ignore_stop=True)
+            self._drive(tilt_dir + pan_dir, both, ignore_stop=True, cancel_ev=cancel_ev)
         if pan_need and pan_sec > tilt_sec + 0.05:
-            self._drive(pan_dir, pan_sec - both, ignore_stop=True)
+            self._drive(pan_dir, pan_sec - both, ignore_stop=True, cancel_ev=cancel_ev)
         elif tilt_need and tilt_sec > pan_sec + 0.05:
-            self._drive(tilt_dir, tilt_sec - both, ignore_stop=True)
+            self._drive(tilt_dir, tilt_sec - both, ignore_stop=True, cancel_ev=cancel_ev)
         self.send_dir("stop")
         return True
 
