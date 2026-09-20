@@ -41,10 +41,8 @@
 ├── frontend/             # 前端静态文件
 │   ├── index.html        # 控制面板 + 登录
 │   └── satellite.js      # 地图 + 卫星逻辑
-├── esp32s3_as5600/       # ESP32-S3 编码器固件 (MicroPython)
-│   ├── main.py           # AS5600 读取 + UDP 广播
-│   └── wifi_manager.py   # WiFi 连接 + AP 配网
-├── esp_as5600_tcp/       # ESP32 Arduino 版本 (TCP)
+├── esp32s3_as5600/       # 编码器固件 (ESP8266 Arduino, UDP 广播)
+│   └── as5600_tracker_8266/  # 当前在用固件 (WiFi配网/AP热点/UDP上报/OTA)
 ├── docs/                 # 协议文档
 │   ├── D3040.md          # YD3040 云台说明
 │   └── pelcod.md         # Pelco-D 协议
@@ -81,12 +79,12 @@ python main.py
 PTZ_HOST=192.168.x.x PTZ_USER=<用户> PTZ_PASS=你的密码 bash deploy.sh
 ```
 
-### ESP32-S3 固件
+### ESP8266 编码器固件
 
-1. 将 `esp32s3_as5600/` 下文件上传到 ESP32-S3（MicroPython）
+1. 用 Arduino IDE 打开 `esp32s3_as5600/as5600_tracker_8266/as5600_tracker_8266.ino` 烧录（ESP8266 NodeMCU / ESP-12E）
 2. 上电后连接 AP 热点 `AS5600-Setup`（密码 `<热点密码>`）
 3. 访问 `http://192.168.x.x/` 配置 WiFi
-4. ESP32 自动通过 UDP 广播角度数据到端口 8091
+4. ESP8266 自动通过 UDP 广播角度数据到端口 8091
 
 ## 配置说明
 
