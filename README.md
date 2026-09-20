@@ -78,7 +78,7 @@ python main.py
 ### 一键部署 (已有服务器)
 
 ```bash
-PTZ_HOST=192.168.x.x PTZ_USER=aap PTZ_PASS=你的密码 bash deploy.sh
+PTZ_HOST=192.168.x.x PTZ_USER=<用户> PTZ_PASS=你的密码 bash deploy.sh
 ```
 
 ### ESP32-S3 固件
