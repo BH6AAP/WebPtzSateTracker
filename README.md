@@ -14,7 +14,7 @@
 ## 系统架构
 
 ```
-┌─────────────┐   UDP 广播(8091)   ┌──────────────────┐
+┌─────────────┐   UDP 广播(<UDP端口>)   ┌──────────────────┐
 │  ESP32-S3   │ ─────────────────▶ │  j1900 服务器     │
 │  AS5600编码器│                     │  Flask + Waitress │
 └─────────────┘                     │  (ptz.service)    │
@@ -66,7 +66,7 @@ pip install -r requirements.txt
 export PTZ_SERIAL_PORT=/dev/ttyUSB0
 export PTZ_BAUD=9600
 export PTZ_ADDRESS=1
-export PTZ_PORT=8090
+export PTZ_PORT=<Web端口>
 export PTZ_SECRET_KEY=你的随机密钥   # 必填, 用于会话签名
 
 # 3. 启动
@@ -84,7 +84,7 @@ PTZ_HOST=192.168.x.x PTZ_USER=<用户> PTZ_PASS=你的密码 bash deploy.sh
 1. 用 Arduino IDE 打开 `esp32s3_as5600/as5600_tracker_8266/as5600_tracker_8266.ino` 烧录（ESP8266 NodeMCU / ESP-12E）
 2. 上电后连接 AP 热点 `AS5600-Setup`（密码 `<热点密码>`）
 3. 访问 `http://192.168.x.x/` 配置 WiFi
-4. ESP8266 自动通过 UDP 广播角度数据到端口 8091
+4. ESP8266 自动通过 UDP 广播角度数据到端口 <UDP端口>
 
 ## 配置说明
 
@@ -93,7 +93,7 @@ PTZ_HOST=192.168.x.x PTZ_USER=<用户> PTZ_PASS=你的密码 bash deploy.sh
 | `PTZ_SERIAL_PORT` | 串口设备 | `/dev/ttyUSB0` |
 | `PTZ_BAUD` | 波特率 | `9600` |
 | `PTZ_ADDRESS` | 云台地址 | `1` |
-| `PTZ_PORT` | Web 端口 | `8090` |
+| `PTZ_PORT` | Web 端口 | `<Web端口>` |
 | `PTZ_SECRET_KEY` | 会话签名密钥（必填） | 无 |
 
 ## 协议
