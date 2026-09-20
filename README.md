@@ -78,14 +78,14 @@ python main.py
 ### 一键部署 (已有服务器)
 
 ```bash
-PTZ_HOST=192.168.31.67 PTZ_USER=aap PTZ_PASS=你的密码 bash deploy.sh
+PTZ_HOST=192.168.x.x PTZ_USER=aap PTZ_PASS=你的密码 bash deploy.sh
 ```
 
 ### ESP32-S3 固件
 
 1. 将 `esp32s3_as5600/` 下文件上传到 ESP32-S3（MicroPython）
-2. 上电后连接 AP 热点 `AS5600-Setup`（密码 `12345678`）
-3. 访问 `http://192.168.4.1/` 配置 WiFi
+2. 上电后连接 AP 热点 `AS5600-Setup`（密码 `<热点密码>`）
+3. 访问 `http://192.168.x.x/` 配置 WiFi
 4. ESP32 自动通过 UDP 广播角度数据到端口 8091
 
 ## 配置说明
