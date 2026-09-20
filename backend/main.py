@@ -53,6 +53,7 @@ DEFAULT_CONFIG = {
     "tilt_min": 0.0,            # 俯仰最小角度
     "tilt_max": 90.0,           # 俯仰最大角度
     "reset_tilt_s": 15.0,       # 复位俯仰移动时长(秒)
+    "track_timeout_min": 25.0,  # 点击"开始跟踪"后计时自动停止(分钟), 默认 25 分钟
     "show_maidenhead_grid": False,   # 地图显示梅登海德网格
     "lotw_callsign": "",             # LoTW 登录呼号
     "lotw_password": "",             # LoTW 登录密码
@@ -300,9 +301,12 @@ def get_serial() -> serial.Serial:
 
 
 def send(cmd: bytes) -> None:
-    """发送一帧指令到串口 (暂停时不发送; 写入失败自动重连一次)"""
+    """发送一帧指令到串口 (暂停时挡 move 但放行 stop; 写入失败自动重连一次)"""
     global _last_send_time
-    if is_paused():
+    # 运动账本: 在任何提前返回前登记, 保证状态准确
+    _update_motion_ledger(cmd)
+    # 暂停只挡运动帧; stop 帧穿透, 避免"move 后进暂停吞掉 stop"导致锁存持续转动
+    if is_paused() and _frame_kind(cmd) != "stop":
         return
     for attempt in (0, 1):
         try:
@@ -333,6 +337,33 @@ def _serial_reader():
 
 
 threading.Thread(target=_serial_reader, daemon=True).start()
+
+
+# ---------- 运动看门狗 (漏发 stop 补发) ----------
+def _motion_watchdog():
+    """轮询运动账本: move 已发但超期未 stop => 补发 stop 防锁存持续转动。
+    覆盖全部运动路径 (跟踪/move_to/复位/手动/rotctld), 与跟踪专用 watchdog 互补。"""
+    global _motion_active
+    while True:
+        time.sleep(0.5)
+        try:
+            if _motion_active and time.time() >= _motion_deadline:
+                print("[motion] 运动超时无 stop, 补发停止帧 (防锁存缠绕)", flush=True)
+                for _ in range(3):
+                    # stop 帧始终穿透暂停与账本, 确保到达串口
+                    _update_motion_ledger(pelco.stop())
+                    if not is_paused():
+                        try:
+                            send(pelco.stop())
+                        except Exception:  # noqa: BLE001
+                            pass
+                    time.sleep(0.1)
+                _motion_active = False
+        except Exception:  # noqa: BLE001
+            pass
+
+
+threading.Thread(target=_motion_watchdog, daemon=True).start()
 
 
 # ---------- 模糊位置(航位推算) ----------
@@ -528,8 +559,10 @@ def _sat_send_dir(direction: str):
             send(pelco.stop())
         else:
             send(_MOVE_CMDS[direction]())
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # 诊断黑洞: 此前静默吞掉 send 异常, 串口失败时跟踪循环照常发指令但云台
+        # 收不到帧 (停转/失控) 却无任何日志, 极难排查
+        print(f"[track] send_dir({direction}) 发送失败: {e!r}", flush=True)
 
 
 def _sat_get_position():
@@ -606,14 +639,21 @@ def _probe_recover_direction():
         _stop_send()
         print(f"[reset/probe] 串口发送失败: {e}", flush=True)
         return "stop"
-    off1 = _get_enc_offset()
-    if off1 is None:
-        print("[reset/probe] 试探后无偏移数据", flush=True)
-        return "stop"
+    # 停止后等编码器刷新: 弱链路(电力猫 170ms+)回传延迟大, 只读一次可能读到旧值
+    # → dOff=0 → 默认 right 误判 (曾现: off=107 被错判 right, 越转越远到 256)
+    off1 = off0
+    _probe_deadline = time.time() + RECOVER_PROBE_S
+    while time.time() < _probe_deadline:
+        cur = _get_enc_offset()
+        if cur is not None:
+            off1 = cur
+        if abs(off1 - off0) >= 2.0:   # 反馈已更新 (≥2 ESP = 0.5°物理)
+            break
+        time.sleep(0.05)
     print(f"[reset/probe] off0={off0:.0f} off1={off1:.0f} dOff={off1-off0:.0f}°ESP", flush=True)
     if abs(off1) < abs(off0):
         return "left"          # left 使偏移收敛
-    return "right"             # left 使偏移发散 -> 用 right
+    return "right"             # left 使偏移发散/无反馈 -> 用 right
 
 
 def _recover_from_tangle():
@@ -738,7 +778,9 @@ def _reset_loop(tilt_s: float):
     tilt_deadline = time.time() + tilt_s if tilt_s > 0 else None
     find_deadline = time.time() + FIND_ZERO_TIMEOUT
     _loop_cnt = 0
-
+    _last_off = None          # 上一次检查点的偏移 (ESP32 域), 用于收敛检测
+    _diverged_cnt = 0         # 连续发散计数: 试探方向可能误判 (无反馈时默认 right),
+                              # 驱动中连续 2 次检查偏移未收敛 -> 自动反转方向 (防越转越远)
     while time.time() < find_deadline:
         # 紧急刹车: 立即中止复位 (send() 已被 paused 阻断, 云台静止;
         # 不重锚、不归零, 保持当前基准, 恢复后可重新复位)
@@ -777,10 +819,27 @@ def _reset_loop(tilt_s: float):
         else:
             cmd = pelco.up()   # 俯仰归零 (标准 UP 帧 = 低头, 与 _finalize 一致)
         _loop_cnt += 1
-        if _loop_cnt % 20 == 1:  # 每 ~2s 打印一次角度
+        if _loop_cnt % 20 == 1:  # 每 ~2s 打印一次角度 + 实时收敛检测
             _cur_off = _get_enc_offset()
             print(f"[reset] 驱动中 dir={direction} off={_cur_off:.0f}°ESP "
                   f"t={time.time()-find_deadline+FIND_ZERO_TIMEOUT:.1f}s", flush=True)
+            # 收敛检测: 方向试探可能误判 (无编码器反馈默认 right), 驱动中校验。
+            # 只在读数确实更新时评估方向: |off| 应向 0 收敛。
+            # 读数冻结 (off 几乎不变: 弱链路包稀疏/滤波拒绝) 不等于方向错,
+            # 不得触发反转 —— 曾现: 冻结期间被误判发散, 方向反复横跳,
+            # 云台左右摇摆永远到不了光电 (12:30 复位找不到基准角)
+            if _cur_off is not None and _last_off is not None \
+                    and abs(_cur_off - _last_off) >= 2.0:
+                if abs(_cur_off) > abs(_last_off):   # 读数更新但远离 0 -> 真发散
+                    _diverged_cnt += 1
+                    if _diverged_cnt >= 2:
+                        direction = "left" if direction == "right" else "right"
+                        _diverged_cnt = 0
+                        print(f"[reset] 方向反转 -> {direction} "
+                              f"(off {_last_off:.0f}->{_cur_off:.0f} 发散)", flush=True)
+                else:
+                    _diverged_cnt = 0   # 收敛
+            _last_off = _cur_off
         try:
             send(cmd)
         except Exception:  # noqa: BLE001
@@ -840,6 +899,20 @@ sat_tracker.tilt_speed = get_cfg("tilt_speed_dps")
 sat_tracker.tilt_up_speed = get_cfg("tilt_up_speed_dps")
 sat_tracker.tilt_down_speed = get_cfg("tilt_down_speed_dps")
 sat_tracker.accel_time = get_cfg("accel_time")
+
+# 跟踪自动停止提醒: satellite 停止时经 hook 写入一次性原因, 状态帧推送后清空
+_auto_stop_alert = None
+_auto_stop_lock = threading.Lock()
+
+
+def _set_auto_stop_alert(reason: str):
+    """卫星跟踪自动停止(出境/超时)后由 sat_tracker 调用, 供前端提醒是否返回 0°"""
+    global _auto_stop_alert
+    with _auto_stop_lock:
+        _auto_stop_alert = reason
+
+
+sat_tracker._auto_stop_hook = _set_auto_stop_alert
 
 
 # ---------- SkyRoof / Hamlib rotctld 桥接 (TCP 4533) ----------
@@ -1104,6 +1177,96 @@ def ws_url():
 
 
 # ---------- 状态 ----------
+# ---------- 系统资源监控 (温度/CPU/内存; 纯标准库, 免 psutil 依赖) ----------
+_sys_cpu_prev = None     # 上一采样 /proc/stat 累计值 (total, idle), 用于算 CPU 差值
+_sys_net_prev = None     # 上一采样 /proc/net/dev 累计值 (rx, tx, ts), 用于算带宽差值
+
+
+def _sys_metrics() -> dict:
+    """采集主机温度/CPU/内存占用率/网口带宽。读不到对应项时置 None, 不抛异常。
+    CPU/带宽需两次采样算差值, 后续每帧调用自动平滑。"""
+    global _sys_cpu_prev, _sys_net_prev
+    m = {"temp_c": None, "cpu_pct": None, "mem_pct": None, "net_rx": None, "net_tx": None, "net_cap": None}
+    # 温度: 常见 SoC 热区 (毫度)
+    try:
+        if os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                m["temp_c"] = round(int(f.read().strip()) / 1000.0, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    # CPU 使用率: /proc/stat 首行累计值差分
+    try:
+        with open("/proc/stat") as f:
+            fields = [int(v) for v in f.readline().split()[1:]]
+        total = sum(fields)
+        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+        if _sys_cpu_prev:
+            d_total = total - _sys_cpu_prev[0]
+            d_idle = idle - _sys_cpu_prev[1]
+            if d_total > 0:
+                m["cpu_pct"] = round(100.0 * (1 - d_idle / d_total), 1)
+        _sys_cpu_prev = (total, idle)
+    except Exception:  # noqa: BLE001
+        pass
+    # 内存占用率: /proc/meminfo
+    try:
+        total = avail = None
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                k = ln.split(":", 1)[0]
+                if k in ("MemTotal", "MemAvailable"):
+                    v = int(ln.split()[1])
+                    if k == "MemTotal":
+                        total = v
+                    else:
+                        avail = v
+        if total and avail:
+            m["mem_pct"] = round(100.0 * (total - avail) / total, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    # 网口带宽: /proc/net/dev 收发字节差值 / 时间差 (bytes/s; 汇总除 loopback 外所有接口)
+    try:
+        rx = tx = 0
+        with open("/proc/net/dev") as f:
+            next(f), next(f)   # 跳过两行表头
+            for ln in f:
+                p = ln.split()
+                if p[0].rstrip(":") == "lo":
+                    continue
+                rx += int(p[1])    # bytes recv
+                tx += int(p[9])    # bytes transmit
+        now = time.time()
+        if _sys_net_prev:
+            prx, ptx, pts = _sys_net_prev
+            dt = now - pts
+            if dt > 0:
+                m["net_rx"] = max(0.0, (rx - prx) / dt)
+                m["net_tx"] = max(0.0, (tx - ptx) / dt)
+        _sys_net_prev = (rx, tx, now)
+    except Exception:  # noqa: BLE001
+        pass
+    # 网口能力(协商速率): 仅物理 up 网口 (排除 lo/docker/br-/veth 等虚拟接口)
+    # speed 单位 Mbps; 显示为 100M / 1G / 10G 等能力档位
+    try:
+        caps = []
+        for iface in os.listdir("/sys/class/net"):
+            if iface == "lo" or iface.startswith(("docker", "br-", "veth")):
+                continue
+            base = f"/sys/class/net/{iface}"
+            try:
+                if open(f"{base}/operstate").read().strip() != "up":
+                    continue
+                sp = int(open(f"{base}/speed").read().strip())
+                if sp > 0:
+                    caps.append(f"{iface}={sp / 1000:.0f}G" if sp >= 1000 else f"{iface}={sp}M")
+            except Exception:  # noqa: BLE001
+                continue
+        m["net_cap"] = " ".join(caps) or None
+    except Exception:  # noqa: BLE001
+        pass
+    return m
+
+
 def _status_payload() -> dict:
     """串口/系统状态 (供 /api/status 与 SSE 状态帧共用)"""
     ser = get_serial()
@@ -1114,7 +1277,9 @@ def _status_payload() -> dict:
             "address": PTZ_ADDRESS, "open": ser.is_open,
             "paused": is_paused(),
             "resetting": is_resetting(),
+            "tracking": sat_tracker.is_tracking(),   # 卫星/天体跟踪中 (前端据此同步按钮状态, 不依赖一次性 alert)
             "udp_online": udp_online,
+            "sys": _sys_metrics(),   # 系统状态: 温度/CPU/内存
             "tangle_warn": _encoder_state.get("tangle_warn"),
             "pan_speed_dps": get_cfg("pan_speed_dps"),
             "tilt_speed_dps": get_cfg("tilt_speed_dps"),
@@ -1169,6 +1334,13 @@ def _stream_state(norad, celestial):
     frame["rotctld_connected"] = bool(
         rotctld_srv is not None and rotctld_srv.connected
     )
+    # 跟踪自动停止提醒 (一次性: 读后清空; 'los'=卫星出境 / 'timeout'=跟踪超时)
+    global _auto_stop_alert
+    with _auto_stop_lock:
+        alert = _auto_stop_alert
+        _auto_stop_alert = None
+    if alert:
+        frame["alert"] = alert
     return frame
 
 
@@ -1395,9 +1567,13 @@ def reset():
     except Exception:  # noqa: BLE001
         pass
     set_resetting(True)
+    # 全程豁免单次驱动上限: 同步回转(_recover_from_tangle, 可能 >72s) + 异步找零(_run, 一整圈)
+    global _motion_exempt
+    _motion_exempt = True
     # 超限回转检测: 当前已越出防缠绕范围时, 先尝试自动回 0°; 回不去则立即提示, 不执行复位
     rec_ok, rec_detail = _recover_from_tangle()
     if not rec_ok:
+        _motion_exempt = False
         set_resetting(False)
         return ok({"detail": rec_detail, "abort": True})
     # 水平轴由低速转圈 + 光电零位找 0 (无时间设置); 俯仰轴按时间复位回 0°
@@ -1409,11 +1585,14 @@ def reset():
     tilt_s = min(17.0, max(tilt_s, get_cfg("reset_tilt_s")))
 
     def _run():
+        global _motion_exempt
+        _motion_exempt = True   # 复位找零需转一整圈, 豁免单次驱动上限
         try:
             _reset_loop(tilt_s)
         except Exception:  # noqa: BLE001
             pass
         finally:
+            _motion_exempt = False
             set_resetting(False)
     threading.Thread(target=_run, daemon=True).start()
     # 找零最多转一圈: 低速速率 = 全速 × 速度档位/0x20, 最坏时长 = 360°/低速速率
@@ -1449,6 +1628,8 @@ def anti_tangle_reset():
     set_resetting(True)
 
     def _run():
+        global _motion_exempt
+        _motion_exempt = True   # 防缠绕回退可能多圈, 豁免单次驱动上限
         try:
             # 用 AS5600 反馈闭环回退: 持续反向转动, 直到累计归零 (回到无缠绕起点)
             # 比时间估算精确, 且能正确处理多圈缠绕
@@ -1470,6 +1651,7 @@ def anti_tangle_reset():
         except Exception:  # noqa: BLE001
             pass
         finally:
+            _motion_exempt = False
             with tracker.lock:
                 tracker._finalize()
                 tracker.pan_accum = 0.0  # 防缠绕复位后清零
@@ -1736,7 +1918,7 @@ def sat_radar(norad: str):
                 meta = p
                 break
     else:
-        cp = satellite.current_pass_info(norad)
+        cp = satellite.current_pass_info_cached(norad)
         if cp:
             aos, los, meta = cp["aos"], cp["los"], cp
         else:
@@ -1836,6 +2018,47 @@ ENC_FILT_DIR_TOL = 0.5           # 反向判定死区: 物理°/s, 低于此视�
 _last_filt_angle = None           # 上次通过滤波的 ESP32 累积角度
 _last_filt_time = 0.0             # 上次通过滤波的时间戳
 _last_send_time = 0.0             # 上次发送 485 指令的时间
+
+# ---------- 运动账本 (防缠绕 + 漏发 stop 补发) ----------
+# 云台为单帧锁存型: move 帧发出后持续转动直到 stop 帧。
+# 若 move 后因暂停/串口异常/线程崩溃漏发 stop, 云台会一直转(锁存)导致缠绕失控。
+# 全局统一在 send() 底层记账 + 独立看门狗轮询补发 stop, 覆盖全部运动路径。
+_motion_active = False            # 是否处于"已下发 move 未收到 stop"状态
+_motion_deadline = 0.0            # 期望 stop 的最后期限 (到期未停则看门狗补发)
+_motion_exempt = False            # 豁免标志 (复位找零需转一整圈, 不受单次驱动上限约束)
+_motion_lock = threading.Lock()
+
+
+def _frame_kind(cmd: bytes) -> str:
+    """按帧类型区分: 'stop' / 'move' / 'other'
+    Pelco-D: 停帧 cmd2==0; 水平/俯仰运动帧 cmd2 高半字节为 0 (0x02~0x14);
+    查询/变焦等 cmd2 高半字节非 0, 不参与运动记账。"""
+    if len(cmd) < 7:
+        return "other"
+    cmd2 = cmd[2]
+    if cmd2 == 0:
+        return "stop"
+    if (cmd2 & 0xF0) == 0:
+        return "move"
+    return "other"
+
+
+def _update_motion_ledger(cmd: bytes):
+    """send() 底层记账: move 登记截止期限 / stop 清除运动状态"""
+    global _motion_active, _motion_deadline
+    kind = _frame_kind(cmd)
+    if kind == "stop":
+        with _motion_lock:
+            _motion_active = False
+    elif kind == "move":
+        with _motion_lock:
+            _motion_active = True
+            # 复位找零可豁免单次驱动上限, 但仍有复位自身 FIND_ZERO_TIMEOUT 兜底
+            if _motion_exempt:
+                _motion_deadline = time.time() + FIND_ZERO_TIMEOUT
+            else:
+                # 单次驱动时长上限 (防缠绕), 默认 1.5 圈 @~7.5°/s ≈ 72s, 可配置
+                _motion_deadline = time.time() + get_cfg("max_move_sec", 72.0)
 _last_rejected = False             # 上一个 UDP 包是否被滤波丢弃
 _rej_stable_cnt = 0                # 连续拒绝计数 (拒绝包自身稳定时递增, 用于漂移恢复)
 _rej_stable_angle = None           # 上一个被拒包的角度
@@ -1909,6 +2132,13 @@ def _detect_unwrap_error(angle, now):
     global _last_filt_angle, _last_filt_time, _UNWRAP_LAST_CORRECT
     if _last_filt_angle is None or not _encoder_cal.get("zero_angle"):
         return False
+    # 运动中禁用: 跟踪/转向时 angle 持续累积前进, 而 _last_filt_angle 可能因包稀疏/
+    # 被拒而冻结在旧值, 真实运动差 ±360°ESP(=90°物理) 会被误判为 AS5600 振荡,
+    # 修正 zero_angle 导致 pan 突跳 90° (曾现: 顺时针跟踪 pan 79.6→24.0 方向跳回)。
+    # 该修正仅用于静止时修复振荡偏移, 运动中宁可维持现基准, 待停止/复位后再检测。
+    with tracker.lock:
+        if tracker._moving is not None:
+            return False
     if now - _UNWRAP_LAST_CORRECT < 5.0:
         return False
     zero = _encoder_cal["zero_angle"]
@@ -2034,14 +2264,23 @@ def _process_encoder_data(angle, raw):
         _rej_stable_angle = angle
         _rej_stable_t = now
         if _rej_stable_cnt >= 5:
-            _last_filt_angle = angle
-            _last_filt_time = now
-            _rej_stable_cnt = 0
-            _rej_stable_angle = None
-            _last_rejected = False
-            trusted_accept = False   # 恢复值仍可能带噪声: 走慢速平滑, 不猛拉 dpan
-            print(f"[filter] 连续稳定确认, 编码器基准恢复: {angle:.2f}", flush=True)
-            # fall through 走下方接受路径更新位置
+            with tracker.lock:
+                _in_motion = tracker._moving is not None
+            if _in_motion:
+                # 运动中禁用"连续稳定采信": 转向/跟踪中云台位置持续变化, 被拒包
+                # 的"稳定值"多半是毛刺/干扰, 采信会让 pan 突跳几十度, 跟踪循环
+                # 据此算错 daz 云台反向/多转 (用户反馈"转向中回传大跳变未过滤")。
+                # 静止(手动/复位后)时恢复仍有效。
+                _rej_stable_cnt = 0
+            else:
+                _last_filt_angle = angle
+                _last_filt_time = now
+                _rej_stable_cnt = 0
+                _rej_stable_angle = None
+                _last_rejected = False
+                trusted_accept = False   # 恢复值仍可能带噪声: 走慢速平滑, 不猛拉 dpan
+                print(f"[filter] 连续稳定确认, 编码器基准恢复: {angle:.2f}", flush=True)
+                # fall through 走下方接受路径更新位置
         else:
             # 尝试检测并修正 AS5600 振荡后的 ±360° unwrap 偏移 (偏 90° 根因)
             _detect_unwrap_error(angle, now)
@@ -2258,7 +2497,7 @@ def _photo_calib_on_trigger(angle_val):
 
 def _photo_calib_worker():
     """后台: 控制云台全速右转一圈, 两次光电触发后校零+测速"""
-    global _last_pan_cont
+    global _last_pan_cont, _display_pan
     try:
         with _photo_calib_lock:
             stop_ev = _photo_calib["stop_cmd"] = threading.Event()
@@ -2283,6 +2522,7 @@ def _photo_calib_worker():
             time.sleep(0.15)
         # 结算
         with _photo_calib_lock:
+            mode = _photo_calib.get("mode", "auto")
             done = _photo_calib["phase"] == "done"
             start_angle = _photo_calib.get("start_angle")
             end_angle = _photo_calib.get("end_angle")
@@ -2310,6 +2550,11 @@ def _photo_calib_worker():
                         tracker.tilt = 0.0
                         tracker._pan_base, tracker._tilt_base = 0.0, 0.0
                         tracker.pan_accum = 0.0
+                # 归零显示角 (前端方向线/大数字驱动), 与手动 setzero 行为一致
+                with _encoder_lock:
+                    if mode == "auto":
+                        _display_pan = 0.0
+                        _encoder_state["dpan"] = 0.0
                 result = {
                     "ok": True,
                     "ratio": round(as5600_revs, 4),

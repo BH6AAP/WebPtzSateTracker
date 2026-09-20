@@ -7,6 +7,7 @@
   let trackLayers = {};   // norad -> L.polyline
   let satPosMarkers = {}; // norad -> {circle, label}
   let currentMarker = null;
+  let followLast = null;     // 上一帧跟随星下点 (用于 panTo 节流, 防动画堆积卡死)
   let coverageLayer = null; // 卫星覆盖范围圆
   let followSat = false;    // 是否跟随卫星 (点击卫星后开启, 手动拖动地图时关闭)
   let tracking = false;
@@ -27,7 +28,8 @@
     map = L.map('map', {
       minZoom: 2, maxZoom: 18,
       zoomControl: false,
-      worldCopyJump: true   // 拖过边缘自动跳转
+      worldCopyJump: true,   // 拖过边缘自动跳转
+      preferCanvas: true     // 矢量层用 Canvas 渲染: 缩放时整张画布重绘远快于海量 SVG DOM 节点
     });
     // 缩放按钮放置右下角
     L.control.zoom({ position: 'bottomright' }).addTo(map);
@@ -35,6 +37,7 @@
 // 底图: 天地图矢量瓦片 (含行政边界) — 通过后端代理绕过 WAF
     L.tileLayer('/tdt/vec/{z}/{x}/{y}', {
       maxZoom: 18,
+      updateWhenZooming: false,   // 缩放期间沿用旧瓦片, 新瓦片就绪后替换, 减少请求风暴与闪烁
       attribution: '&copy; 天地图'
     }).addTo(map);
     // 预取当前视口瓦片: 打开地图即刻显示, 避免弱链路下逐片等加载
@@ -43,6 +46,7 @@
     if (TDT_KEY) {
       L.tileLayer('/tdt/cva/{z}/{x}/{y}', {
         maxZoom: 18,
+        updateWhenZooming: false,   // 缩放沿用旧标注瓦片, 减少请求与重绘
         attribution: '&copy; 天地图'
       }).addTo(map);
     }
@@ -263,6 +267,8 @@
           const sec = Math.max(0, f.next_aos - now);
           const urgentClass = sec < 1800 ? ' urgent' : '';
           infoHtml = `<span class="countdown${urgentClass}">${formatCountdown(sec)}后过境</span> · 最大仰角 ${f.max_el}°`;
+        } else if (f.status === 'pending') {
+          infoHtml = `<span class="countdown">正在获取过境数据...</span>`;
         } else {
           infoHtml = `<span class="countdown">未来48小时无过境</span>`;
         }
@@ -270,6 +276,13 @@
           <button class="del" data-norad="${f.norad}">删除</button>`;
         item.addEventListener('click', (e) => {
           if (e.target.classList.contains('del')) return;
+          if (String(f.norad) === String(currentNorad)) {
+            // 再次点击已选中卫星: 取消选中并跳回观测站
+            clearSatellite();
+            const obs = window.obsPos || [20, 0];
+            map.setView(obs, 3);
+            return;
+          }
           selectSatellite(f.norad, f.name || f.norad);
         });
         item.querySelector('.del').addEventListener('click', async (e) => {
@@ -518,6 +531,9 @@
     drawRadar([], null, null);
     currentNorad = norad;
     currentSatName = name || norad;
+    // 切换卫星: 重置星下点 marker (重建以刷新名称标签) 与跟随节流记录
+    if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
+    followLast = null;
     try { localStorage.setItem('lastSat', JSON.stringify({ norad, name: currentSatName })); } catch (e) { /* 忽略 */ }
     // 高亮列表
     document.querySelectorAll('.fav-item').forEach(el => el.classList.remove('active'));
@@ -572,23 +588,34 @@
   // 卫星覆盖圆半径: 仰角>=0 的地面范围 (米)
   function coverageRadius(altKm) {
     const R = 6371;
-    const h = Math.max(altKm, 100);
+    let h = Number(altKm);
+    // 异常高度 (undefined/NaN/过低) 用典型 LEO 高度兜底, 避免画出异常小圆
+    if (!isFinite(h) || h < 300) h = 550;
     const gamma = Math.acos(R / (R + h)); // 地心角 rad
     return gamma * R * 1000;
   }
-  // 绘制/更新覆盖圆 (圆心跟随星下点)
+  // 绘制/更新覆盖圆 (圆心跟随星下点, 半径每帧同步当前卫星高度:
+  // 否则创建时用旧卫星(如低轨)算的半径, 切换卫星后只动圆心半径不变 → 圈偏小/偏大)
   function drawCoverage(subLat, subLon, altKm) {
+    if (subLat == null || subLon == null || altKm == null) return;
     const latlng = [subLat, subLon];
-    if (coverageLayer) { coverageLayer.setLatLng(latlng); return; }
+    const radius = coverageRadius(altKm);
+    if (coverageLayer) {
+      // 值未变时跳过 setLatLng/setRadius, 避免每帧触发地图 repaint 堆积卡死
+      const cur = coverageLayer.getLatLng();
+      if (Math.abs(cur.lat - subLat) > 0.05 || Math.abs(cur.lng - subLon) > 0.05) coverageLayer.setLatLng(latlng);
+      if (Math.abs(coverageLayer.getRadius() - radius) > 1) coverageLayer.setRadius(radius);
+      return;
+    }
     coverageLayer = L.circle(latlng, {
-      radius: coverageRadius(altKm),
+      radius: radius,
       color: '#0ea5e9', weight: 1,
       fillColor: '#0ea5e9', fillOpacity: 0.08
     }).addTo(map);
   }
 
-  // ===== 卫星信息渲染 (数据由 SSE state 帧提供) =====
-  function renderSatState(data) {
+  // ===== 卫星信息渲染 (数据由 SSE state 帧提供; enc 提供云台指向角度) =====
+  function renderSatState(data, enc) {
     if (!data) return;
     $('satInfo').innerHTML = `
       <div class="row"><span class="k">方位角</span><span class="v">${data.azimuth}°</span></div>
@@ -597,25 +624,35 @@
       <div class="row"><span class="k">可见</span><span class="v" style="color:${data.visible ? '#4ade80' : '#ef4444'}">${data.visible ? '是' : '否'}</span></div>`;
     // 覆盖范围圆 (跟随星下点)
     drawCoverage(data.sub_lat, data.sub_lon, data.alt_km);
-    // 地图上当前星下点 (脉冲高亮标记 + 卫星名称标签, 与未选中的黄色圆点区分)
-    if (currentMarker) map.removeLayer(currentMarker);
+    // 地图上当前星下点标记: 复用 marker 仅 setLatLng, 禁止每帧 removeLayer/重建 (会造成 GC+重排卡顿)
+    const latlng = [data.sub_lat, data.sub_lon];
     const labelText = currentSatName || '卫星';
-    currentMarker = L.layerGroup([
-      L.marker([data.sub_lat, data.sub_lon], {
-        icon: L.divIcon({
-          className: 'cur-sat-wrap',
-          html: '<span class="cur-sat-pulse"></span><span class="cur-sat-dot"></span>',
-          iconSize: [18, 18], iconAnchor: [9, 9]
+    if (!currentMarker) {
+      currentMarker = L.layerGroup([
+        L.marker(latlng, {
+          icon: L.divIcon({
+            className: 'cur-sat-wrap',
+            html: '<span class="cur-sat-pulse"></span><span class="cur-sat-dot"></span>',
+            iconSize: [18, 18], iconAnchor: [9, 9]
+          })
+        }),
+        L.marker(latlng, {
+          icon: L.divIcon({ className: 'sat-label', html: labelText, iconSize: [100, 16] })
         })
-      }),
-      L.marker([data.sub_lat, data.sub_lon], {
-        icon: L.divIcon({ className: 'sat-label', html: labelText, iconSize: [100, 16] })
-      })
-    ]).addTo(map);
-    // 跟随卫星: 地图中心平滑移动到当前星下点
-    if (followSat) map.panTo([data.sub_lat, data.sub_lon], { animate: true, duration: 0.5 });
-    // 雷达图当前点
-    drawRadar(radarPoints, { az: data.azimuth, el: data.elevation }, radarPass);
+      ]).addTo(map);
+    } else {
+      currentMarker.getLayers().forEach(mk => mk.setLatLng(latlng));
+    }
+    // 跟随卫星: 星下点位移较大才触发平移动画, 避免每帧 panTo(animate) 打断重启动画导致卡死
+    if (followSat) {
+      const d = followLast && (Math.abs(data.sub_lat - followLast[0]) +
+                               Math.abs(data.sub_lon - followLast[1]) > 1.2);
+      followLast = [data.sub_lat, data.sub_lon];
+      if (!d) map.panTo(latlng, { animate: true, duration: 0.4 });
+    }
+    // 雷达图当前点 + 云台指向 (与地图方向线一致: 优先 dpan, 无则 pan)
+    const panVal = enc && (enc.dpan != null ? Number(enc.dpan) : enc.pan);
+    drawRadar(radarPoints, { az: data.azimuth, el: data.elevation, pan: panVal }, radarPass);
   }
 
   // ===== 过境列表 =====
@@ -751,6 +788,25 @@
       ctx.beginPath();
       ctx.arc(x, y, 5, 0, Math.PI * 2);
       ctx.fill();
+      // 云台指向指示: 从圆心指向当前 pan 方位 (绿色虚线 + 端点圆)
+      // 与卫星方位同坐标系 (0°=北, 顺时针); pan 无效时跳过
+      if (current.pan != null && !isNaN(current.pan)) {
+        const pa = current.pan * Math.PI / 180;
+        const px = cx + (R - 8) * Math.sin(pa);
+        const py = cy - (R - 8) * Math.cos(pa);
+        ctx.strokeStyle = '#22c55e';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([7, 4]);
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(px, py);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#22c55e';
+        ctx.beginPath();
+        ctx.arc(px, py, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
     // 过境 AOS 起点标记 (外圈, el≈0)
     if (passInfo && passInfo.aos_az !== undefined) {
@@ -1029,11 +1085,28 @@
           // rotctld_connected 是 state 帧顶层字段, 合并进 status 再渲染 (否则恒显离线)
           window.renderStatus(Object.assign({}, d.status, { rotctld_connected: !!d.rotctld_connected }));
         }
+        // 跟踪状态实时同步: 后端已自动停止(出境/超时)时复位前端按钮。
+        // 不依赖一次性 alert(弱网下可能丢失), 每帧 status.tracking 为准
+        if (d.status && typeof d.status.tracking === 'boolean' && d.status.tracking === false && tracking) {
+          trackingTarget = 'sat';
+          setTrackingUI(false);
+        }
         if (window.renderPosition) window.renderPosition(d.pos);
         if (d.enc) applyEncFrame(d.enc);          // 角度/方向线/编码器面板: 实时驱动
         if (d.cel) updateCelOverlays(d.cel);
-        if (d.sat && d.sat_kind === 'sat') renderSatState(d.sat);
+        if (d.sat && d.sat_kind === 'sat') renderSatState(d.sat, d.enc);
         else if (d.sat) renderCelestial(d.sat, d.sat_kind);
+        // 跟踪自动停止提醒 (一次性): 同步前端跟踪状态, 确认后复位回 0°
+        if (d.alert) {
+          if (tracking) { trackingTarget = 'sat'; setTrackingUI(false); }
+          const reason = d.alert === 'timeout' ? '跟踪超时，已自动停止' : '卫星已出境，已自动停止跟踪';
+          if (confirm(reason + '，云台已停止。是否返回 0°？')) {
+            api('/api/reset', {}).then(x => {
+              if (x.abort) toast('无法复位: ' + (x.detail || ''));
+              else toast('复位中，请稍候...');
+            }).catch(() => toast('复位请求失败'));
+          }
+        }
       } else if (name === 'serial') {
         if (window.renderSerialLog) window.renderSerialLog(d);
       } else if ( name === 'favorites') {

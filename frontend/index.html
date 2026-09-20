@@ -369,6 +369,7 @@
   <div class="topbar-left">
     <div class="topbar-item"><span class="dot off" id="serialDot"></span><span id="serialText">RS485 检测中...</span></div>
     <div class="topbar-item"><span class="dot off" id="udpDot"></span><span id="udpText">ESP32 离线</span></div>
+    <div class="topbar-item" id="sysItem" title="系统状态"><span id="sysText">🌡 -- / CPU -- / MEM --</span></div>
     <div class="topbar-item"><span class="dot off" id="rotctldDot"></span><span id="rotctldText">SkyRoof 离线</span></div>    <div class="topbar-item" id="wifiItem" style="display:none;"><span id="wifiText">📶 --</span></div>
   </div>
   <div class="topbar-right" id="topbarRight">
@@ -852,8 +853,10 @@ $('btnTleRefresh').onclick = async () => {
 $('btnSave').onclick = async () => {
   const body = {};
   for (const [id, key] of Object.entries(setMap)) {
-    if ($(id).type === 'checkbox') body[key] = $(id).checked;
-    else { const v = parseFloat($(id).value); if (!isNaN(v)) body[key] = v; }
+    const el = $(id);
+    if (el.type === 'checkbox') body[key] = el.checked;
+    else if (el.type === 'text' || el.type === 'password') body[key] = el.value.trim();
+    else { const v = parseFloat(el.value); if (!isNaN(v)) body[key] = v; }
   }
   // 保存观测站 (支持网格或经纬度)
   const grid = $('setObsGrid').value.trim();
@@ -1007,6 +1010,16 @@ function renderStatus(data) {
     // 更新 SkyRoof 连接状态
     $('rotctldDot').className = data.rotctld_connected ? 'dot on' : 'dot off';
     $('rotctldText').textContent = data.rotctld_connected ? 'SkyRoof 已连接' : 'SkyRoof 离线';
+    // 更新系统状态 (温度/CPU/内存/网口带宽)
+    const sy = data.sys;
+    if (sy) {
+      const t = sy.temp_c != null ? `${sy.temp_c}°C` : '--';
+      const c = sy.cpu_pct != null ? `${sy.cpu_pct}%` : '--';
+      const m = sy.mem_pct != null ? `${sy.mem_pct}%` : '--';
+      const n = (sy.net_rx != null || sy.net_tx != null || sy.net_cap != null)
+        ? ` ⬇${fmtNet(sy.net_rx)} ⬆${fmtNet(sy.net_tx)}${sy.net_cap ? ` @${sy.net_cap}` : ''}` : '';
+      $('sysText').textContent = `🌡 ${t} / CPU ${c} / MEM ${m}${n}`;
+    }
     // 复位完成 -> 恢复按钮控制 (不再依赖固定超时)
     if (_resetInProgress && !data.resetting) _resetDone();
   } else {
@@ -1017,6 +1030,13 @@ function renderStatus(data) {
     $('rotctldDot').className = 'dot off';
     $('rotctldText').textContent = 'SkyRoof 离线';
   }
+}
+
+function fmtNet(b) {
+  if (b == null) return '--';
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + 'M';
+  if (b >= 1024) return (b / 1024).toFixed(0) + 'K';
+  return b.toFixed(0) + 'B';
 }
 
 function onStreamDown() {
@@ -1081,7 +1101,7 @@ function renderEncoder(data) {
 
 loadSettings();
 </script>
-<script src="satellite.js?v=37" defer></script>
+<script src="satellite.js?v=38" defer></script>
 <script>
 // ===== 登录状态管理器 =====
 (function () {

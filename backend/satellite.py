@@ -13,7 +13,6 @@ import os
 import threading
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from sgp4.api import Satrec, jday
@@ -283,16 +282,37 @@ def get_favorites() -> list:
 _fav_refresh_lock = threading.Lock()
 
 
+def _pass_fresh(norad_id: str):
+    """仅读新鲜的过境缓存条目; 未就绪返回 None。绝不触发计算 (防止后台预热期间
+    收藏列表线程现场冷算 6-7s/颗 占满 GIL, 饿死前端请求线程)"""
+    norad = str(norad_id)
+    with _pass_cache_lock:
+        c = _pass_cache.get(norad)
+        # 过期宽限 2 倍: _passes_loop 每 600s 滚动重算, 若某轮被跳过/失败,
+        # 严格 600s 会让整表周期性转 pending; 宽限到 1200s 消除抖动
+        if c and (time.time() - c["time"]) < PASSES_CACHE_AGE * 2:
+            return list(c["passes"])
+    return None
+
+
 def _compute_one_favorite(f: dict, now: float) -> tuple:
-    """计算单颗收藏卫星的富数据, 返回 (排序键, item)。"""
+    """计算单颗收藏卫星的富数据, 返回 (排序键, item)。
+    只读缓存, 绝不现场计算: 过境缓存未就绪时返回 pending 占位项,
+    由后台 _favs_loop 下一轮 (30s) 自动补全, 保证请求零阻塞。"""
     norad = str(f["norad"])
     item = dict(f)
-    passes = compute_passes_cached(norad)  # 读后台过境缓存, 不现场计算
+    passes = _pass_fresh(norad)
+    if passes is None:
+        # 预热未完成 (服务重启后/新增卫星): 先返回占位, 不阻塞, 下轮补全
+        item["status"] = "pending"
+        item["next_aos"] = item["next_los"] = item["max_el"] = None
+        item["aos_az"] = item["los_az"] = None
+        return (1e12, item)
     pos = satellite_position(norad, now)
     cur_el = pos["elevation"] if pos else -90
     if cur_el > 0:
         # 正在过境: 用本次过境信息 (passes[0] 是下一次过境, 峰值/时间均不对)
-        cp = current_pass_info(norad, now)
+        cp = current_pass_info_cached(norad, now)
         if cp is not None:
             item["next_aos"] = cp["aos"]
             item["next_los"] = cp["los"]
@@ -371,10 +391,25 @@ def _kick_fav_refresh() -> None:
 
 
 def _favs_loop() -> None:
-    """后台持续预计算收藏列表富数据: 用户请求只读缓存, 零计算"""
-    time.sleep(2.0)  # 等 update_all_passes 预热过境缓存, 避免冷算重复 (每颗 ~1s)
+    """后台持续预计算收藏列表富数据: 用户请求只读缓存, 零计算。
+    首轮先等过境预热完成 (update_all_passes 4 线程), 期间仅 sleep 不占 CPU,
+    避免在过境缓存就绪前触发现场冷算 (每颗 6-7s × N 颗, GIL 下饿死请求线程)。"""
+    deadline = time.time() + 120.0
+    while time.time() < deadline:
+        with _fav_lock:
+            favs = list(_favorites)
+        if not favs:
+            break
+        # 无 TLE 的星 update_all_passes 不会为其写过境缓存, 视为已就绪,
+        # 否则该星永远不满足 ready → 首轮被卡满 120s 且显示 pending
+        no_tle = {str(f["norad"]) for f in favs if get_tle(str(f["norad"])) is None}
+        with _pass_cache_lock:
+            ready = all(str(f["norad"]) in _pass_cache or str(f["norad"]) in no_tle for f in favs)
+        if ready:
+            break
+        time.sleep(1.0)
     try:
-        _compute_favorites()  # 启动立即产出缓存
+        _compute_favorites()  # 预热完成后立即产出完整缓存
     except Exception:  # noqa: BLE001
         pass
     while True:
@@ -397,6 +432,9 @@ def add_favorite(norad_id: str) -> bool:
         _save_favorites()
     # 增量: 仅计算新收藏的这颗卫星并按排序插入缓存, 不触发全量重算 (省计算)
     try:
+        # 先预热该星过境缓存: 否则 _compute_one_favorite 读不到缓存会返回
+        # pending 占位项 → 新增的卫星一直显示"正在获取过境数据"(最长等到下轮重算)
+        compute_passes_cached(norad_id, True)
         sort_key, item = _compute_one_favorite({"norad": norad_id, "name": tle.get("name", "")}, time.time())
         with _fav_lock:
             cur = [x for x in _fav_cache["data"] if str(x["norad"]) != norad_id]
@@ -765,6 +803,25 @@ _pass_cache_lock = threading.Lock()
 PASSES_CACHE_AGE = 600      # 过境列表每 10 分钟重算
 PASSES_HOURS = 48.0         # 缓存过境计算时长
 
+# 本次过境信息短缓存: current_pass_info 是全量细扫 (~1500 次 SGP4, 1-3s),
+# 收藏列表后台线程每轮都会对其中的"在境卫星"调用, 必须缓存避免 30s 一轮都重扫
+_inpass_cache = {}          # norad -> {"time": 时间戳, "info": ...}
+INPASS_CACHE_AGE = 60.0
+
+
+def current_pass_info_cached(norad_id: str, now: float = None):
+    """current_pass_info 的 60s 短缓存版本 (仅缓存成功结果, 失败不缓存)"""
+    norad = str(norad_id)
+    with _pass_cache_lock:
+        c = _inpass_cache.get(norad)
+        if c and (time.time() - c["time"]) < INPASS_CACHE_AGE:
+            return c["info"]
+    info = current_pass_info(norad, now)
+    if info is not None:
+        with _pass_cache_lock:
+            _inpass_cache[norad] = {"time": time.time(), "info": info}
+    return info
+
 
 def compute_passes_cached(norad_id: str, force: bool = False) -> list:
     """读取过境缓存; 未缓存时现场计算, 过期时返回旧值并交后台重算 (请求不阻塞)"""
@@ -902,25 +959,45 @@ def compute_radar_pass(norad_id: str, aos: float, los: float, step: float = 30.0
 
 
 _pass_updating = threading.Lock()
+_TRACKING_ACTIVE = False   # 跟踪活跃标志: 冷算(过境重算)会持 GIL 数秒/颗, 饿死跟踪循环
+                           # (0.1s 周期被拖到 6-7s, 看门狗反复停云台 → "跟踪中自动停止");
+                           # 跟踪期间冷算线程等待, 跟踪结束再算
 
 
 def update_all_passes() -> None:
-    """后台重算所有收藏卫星的过境列表 (TLE 内容未变时跳过, 避免无谓的重算风暴)"""
+    """后台重算所有收藏卫星的过境列表
+    跳过条件: TLE 未变 且 所有收藏的过境缓存仍在有效期内。
+    注意: 过境是随时间滑动的 48h 窗口, 即使 TLE 不变, 过期后也必须滚动重算,
+    否则收藏列表永远 pending (10 分钟后缓存过期且无人重算的回归 bug)。"""
     global _passes_tle_version
-    if _passes_tle_version == _tle_version:
-        return  # TLE 没变, 已算过的过境列表仍然有效
     if not _pass_updating.acquire(blocking=False):
         return  # 上一次计算还没结束, 跳过本次
     try:
+        # 跟踪活跃期间冷算会饿死跟踪循环(看门狗反复停云台)。最多等 10 分钟
+        # (跟踪默认 25 分钟超时), 超时放弃本轮等下一轮; 过境缓存有 2 倍宽限兜底
+        if _TRACKING_ACTIVE:
+            _wait_deadline = time.time() + 600
+            while _TRACKING_ACTIVE and time.time() < _wait_deadline:
+                time.sleep(10)
         with _fav_lock:
             favs = list(_favorites)
         if not favs:
             _passes_tle_version = _tle_version
             return
-        # 并发预热: 每颗 48h 过境冷算 1~6s, 串行下重启后列表几十秒才就绪; 并行降约 4 倍
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            for f in favs:
-                ex.submit(compute_passes_cached, str(f["norad"]), True)
+        if _passes_tle_version == _tle_version:
+            now = time.time()
+            with _pass_cache_lock:
+                entries = [_pass_cache.get(str(f["norad"])) for f in favs]
+            if all(c and (now - c["time"]) < PASSES_CACHE_AGE for c in entries):
+                return  # TLE 未变且缓存全部新鲜, 无需重算
+        # 串行预热 + 每颗检查跟踪标志: 4 线程并行一旦开始无法中止, 冷算期间
+        # (单颗 5~12s) 持 GIL 饿死跟踪循环 → 水平无法实时修正 ("水平不跟")。
+        # 串行 + 每颗后检查: 跟踪开始后最多再算 1 颗(5~12s)即让出 GIL, 循环恢复自动追回
+        for f in favs:
+            if _TRACKING_ACTIVE:
+                print("[passes] 跟踪活跃, 中止本轮冷算 (剩余留待下轮)", flush=True)
+                break
+            compute_passes_cached(str(f["norad"]), True)
         _passes_tle_version = _tle_version
     finally:
         _pass_updating.release()
@@ -983,7 +1060,20 @@ class SatelliteTracker:
         self._target_el = None          # 当前段目标仰角
         self.target = "sat"             # 跟踪目标类型: 'sat' / 'moon'
         self._target_fn = None          # 目标位置函数: t -> {"azimuth","elevation",...}
+        self._los_since = None          # 卫星仰角转负的起始时间 (持续出境判定, None=未出境)
+        self._los_seen = False          # 本次跟踪是否曾入镜 (el>0.5°): 未入镜的卫星不做出境判定
+                                        # (否则 AOS 前点击跟踪, el 恒为负, 会被误判"已出境"停止)
+        self._track_start_ts = 0.0      # 本次跟踪开始时刻 (计时自动停止用)
+        self._track_timeout_sec = 25 * 60.0  # 跟踪超时(秒): 默认 25 分钟, 由 config.json track_timeout_min 覆盖
+        self._auto_stop_hook = None     # 自动停止回调: callable(reason) (由 main 注入, 推送给前端提醒)
         self._hb = 0.0                  # 跟踪循环心跳时间戳 (看门狗监控用)
+        self._prev_track_pan = None     # 上一周期编码器 pan (连续 enc_ok 下突跳钳制)
+        self._prev_track_enc_ok = False # 上一周期编码器新鲜标志
+        self._prev_track_pan_t = 0.0    # 上一周期编码器接受时刻 (钳制速度阈值用)
+        self._clamp_cnt = 0             # 连续钳制计数 (持续误判时采信真实值打破锁死)
+        self._clamp_dir = None          # 连续钳制方向 (+1/-1): 仅同向跳变才采信,
+                                        # 方向来回翻转(AS5600 双值抖动)不采信防摇摆
+        self._pan_stop_ts = 0.0         # 上次发送 stop 的时间戳 (停止冷却期防过冲重启)
         # 惯性推算 (UDP 丢失时开环跟踪)
         self._dr_start_pan = None  # 断联时的最后编码器角度
         self._dr_start_time = 0.0  # 断联时刻
@@ -1003,10 +1093,33 @@ class SatelliteTracker:
 
     def start(self, norad_id: str, target: str = "sat"):
         """启动跟踪. target: 'sat'=卫星(norad_id) / 'moon'=月球 / 'sun'=太阳 (后两者忽略 norad_id)"""
+        global _TRACKING_ACTIVE
         self.stop()  # 先停止旧线程 (stop 内部自行加锁)
+        _TRACKING_ACTIVE = True   # 跟踪期间暂停过境冷算, 防止 GIL 饿死跟踪循环
         with self._lock:
             self.target = target if target in ("moon", "sun") else "sat"
             self.norad_id = str(norad_id) if target == "sat" else target
+            # 计时自动停止: 每次点击"开始跟踪"重新计时; 配置可调 (config.json track_timeout_min, 默认 25 分钟)
+            try:
+                import json as _json
+                with open(_CONFIG_FILE, "r", encoding="utf-8") as _f:
+                    _t = _json.load(_f).get("track_timeout_min")
+                self._track_timeout_sec = max(0.1, float(_t) * 60.0) if _t else 25 * 60.0
+            except Exception:  # noqa: BLE001
+                self._track_timeout_sec = 25 * 60.0
+            self._track_start_ts = time.time()
+            self._los_since = None   # 新跟踪周期: 清空出境计时 (防残留旧值导致开局误停/不重置)
+            self._los_seen = False   # 新跟踪周期: 重置"曾入镜"标志 (未入镜的卫星不判出境)
+            # 新跟踪周期: 清空 pan 突跳钳制基准。否则上一轮跟踪残留的 prev_pan
+            # (如 23.9) 会与复位后真实位置 (0°) 差 >6° 触发钳制, 把新周期 pan
+            # 锁死在旧值 → daz 符号错误 → 开始跟踪方向判定错 (云台反向转)
+            self._prev_track_pan = None
+            self._prev_track_enc_ok = False
+            self._prev_track_pan_t = 0.0
+            self._clamp_cnt = 0
+            self._clamp_dir = None
+            self._pan_stop_ts = 0.0   # 新跟踪周期: 清空停止冷却时间戳 (防残留值锁死 pan 重启)
+            self._pan_moving = False  # 新跟踪周期: 复位水平运动标志
             if target == "moon":
                 self._target_fn = moon_position
             elif target == "sun":
@@ -1025,6 +1138,8 @@ class SatelliteTracker:
             threading.Thread(target=self._watchdog, args=(stop_ev,), daemon=True).start()
 
     def stop(self):
+        global _TRACKING_ACTIVE
+        _TRACKING_ACTIVE = False   # 跟踪结束: 允许过境冷算恢复
         t = None
         with self._lock:
             if self._stop is not None:
@@ -1144,17 +1259,28 @@ class SatelliteTracker:
         - 俯仰: 死区/步长 1.0°, 减少启停
         """
         cycle = 0.1
-        deadzone = 0.8       # 水平死区(度): 曾 1.5 致稳态落后卫星 ~1°; 收窄后稳态 <0.8°
-        stop_lead = 2.0      # 预测停窗口(度): 移动中误差<此值提前停, 靠滑行入死区
-                             # (滑行距离实测约 <1°, 此值=死区+滑行余量)
+        LOS_STOP_DELAY = 5.0     # 卫星仰角稳定低于 -0.5° 持续此时间(秒)即自动停止跟踪 (防 AOS 抖动误停)
+        deadzone = 0.8       # 水平死区(物理°): 稳态落点 (daz 为物理度, 与阈值同单位)
+        stop_lead = 1.2      # 预测停窗口(物理°): 移动中误差<此值提前停, 靠滑行入死区
+                             # (滑行实测 <0.7°物理, 此值=死区+滑行余量)
+        start_lead = 1.9     # 静止启动阈值(物理°): 窄波束天线误差 <2° 即修正,
+                             # 原 3.5°物理(=14ESP) 导致稳态误差 2.5~3.5° 丢信号
+                             # (用户反馈"追着跑但追不上"). 滞回窗口=start-stop=0.7°,
+                             # 滑行过冲 ~0.7° 后误差仍 <start_lead, 不重新启动
+        pan_stop_cooldown = 0.5   # 停止冷却(s): 发 stop 后云台需时间滑行停稳、编码器读数稳定;
+                                  # 冷却期内禁止重启 move, 防"越过目标后再越回"持续过冲
         tilt_step = 1.0      # 俯仰死区/步长(度): 原 0.5° 小步快跑, 大天线放宽减启停
-        lead_s = 1.2         # 基础提前量(秒): 查询未来位置, 云台提前到位等待而非追赶
-        reaction_s = 0.3     # 云台反应延迟(秒): 额外预测补偿
+        lead_s = 1.8         # 基础提前量(秒): 查询未来位置, 云台提前到位等待而非追赶
+        reaction_s = 0.5     # 云台反应延迟(秒): 485 串口+云台启停延迟补偿, 额外预测补偿
 
         # 角速度跟踪
         prev_az = None
         prev_el = None
         prev_t = None
+        az_rate_s = 0.0      # az_rate EMA 平滑值: SGP4 方位角 0.1° 量化在 0.1s 差分下
+        el_rate_s = 0.0      # 产生 1°/s 假速率 (真实卫星速率仅 ~0.02°/s), 假速率会让
+                             # az_target 虚超前 0.5° (reaction_s=0.5), 小死区下 daz
+                             # 虚高追过头 (用户反馈"追着跑但追不上"的辅助根因)
 
         while not stop_ev.is_set():
             cycle_start = time.time()
@@ -1170,6 +1296,47 @@ class SatelliteTracker:
                     break
                 az, el = tgt["azimuth"], tgt["elevation"]
 
+                # ---- 卫星出境自动停止: 仰角稳定低于 -0.5° 持续 LOS_STOP_DELAY 即停止跟踪 ----
+                # (月球/太阳跟踪不受此限制)
+                # 滞回防抖: el 在 [-0.5, +0.5] 死区时保持原状态, 不重置计时。
+                # 否则低仰角抖动(el 在 0 附近 ±0.3° 波动)会让 _los_since 反复
+                # "置 now → 置 None", 10s 累计永远达不到 → 出境后永不停止(用户反馈的失效)
+                if self.target == "sat":
+                    if el > 0.5:
+                        self._los_seen = True    # 已入镜: 此后 el 转负才可能判"出境"
+                        self._los_since = None
+                    elif el < -0.5 and self._los_seen:
+                        # 仅对"曾入镜"的卫星判出境: 未入镜(AOS 前) el 恒为负,
+                        # 若直接计时会在点击跟踪几秒后误报"卫星已出境"停止
+                        if self._los_since is None:
+                            self._los_since = now
+                        elif now - self._los_since > LOS_STOP_DELAY:
+                            print(f"[track] 卫星已出境 (el<{el:.1f} 持续> {LOS_STOP_DELAY}s), 自动停止跟踪", flush=True)
+                            if self._pan_moving:
+                                self._pan_moving = False
+                                self.send_dir("stop")
+                            if self._auto_stop_hook:
+                                try:
+                                    self._auto_stop_hook("los")
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            stop_ev.set()
+                            break
+
+                # ---- 计时自动停止: 本次跟踪持续超过配置时长(默认25分钟)即停止 ----
+                if now - self._track_start_ts > self._track_timeout_sec:
+                    print(f"[track] 跟踪超时 ({(now - self._track_start_ts) / 60:.1f} 分钟 > 上限), 自动停止跟踪", flush=True)
+                    if self._pan_moving:
+                        self._pan_moving = False
+                        self.send_dir("stop")
+                    if self._auto_stop_hook:
+                        try:
+                            self._auto_stop_hook("timeout")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    stop_ev.set()
+                    break
+
                 # ---- 计算角速度 (用连续周期的未来位置差分) ----
                 az_rate = 0.0
                 el_rate = 0.0
@@ -1178,6 +1345,12 @@ class SatelliteTracker:
                     if dt > 0.05:
                         az_rate = self._pan_delta(az, prev_az) / dt
                         el_rate = (el - prev_el) / dt
+                # EMA 平滑: 滤除 SGP4 方位角 0.1° 量化在 0.1s 差分下的 1°/s 假速率
+                # (真实速率 ~0.02°/s, 平滑后接近真值; 过境高峰期真速率变化也被保留)
+                az_rate = az_rate_s * 0.7 + az_rate * 0.3
+                el_rate = el_rate_s * 0.7 + el_rate * 0.3
+                az_rate_s = az_rate
+                el_rate_s = el_rate
                 prev_az = az
                 prev_el = el
                 prev_t = now
@@ -1189,6 +1362,51 @@ class SatelliteTracker:
                 t_mark = time.time()
                 pan, tilt, enc_ok = self.get_position()
                 t_pos = time.time() - t_mark
+                # 连续 enc_ok 下的 pan 突跳钳制: 正常 0.1s 周期内云台最多转 ~1°物理,
+                # 滤波漏网的毛刺会让 pan 突跳数度~数十度, 直接采纳会算错 daz,
+                # 云台反向或持续多转 (用户反馈"转向中回传大跳变未过滤导致多转几十度")。
+                # 仅当上一周期同样 enc_ok 才钳制; 编码器刚恢复(False→True)允许大跳
+                # (真实位置已变, 必须采纳)。
+                if enc_ok and self._prev_track_enc_ok and self._prev_track_pan is not None:
+                    # 突跳钳制改为速度阈值: 弱链路(电力猫 170ms+ 延迟)时 UDP 编码器包
+                    # 稀疏, 相邻接受帧间隔拉长, 真实运动帧差 >6ESP 会被固定阈值误判毛刺,
+                    # 且钳回后 _prev_track_pan 跟着变旧值 → pan 永久锁死 → daz 恒定 →
+                    # move 永续 → 云台失控猛转 (用户反馈"失控")。允许速度 60ESP/s × 实际
+                    # 间隔: 正常运动不误伤, 真毛刺仍被钳。
+                    dt_p = (time.time() - self._prev_track_pan_t) if self._prev_track_pan_t else 0.1
+                    _jump = self._pan_delta(pan, self._prev_track_pan)
+                    if abs(_jump) > 60.0 * max(dt_p, 0.05):
+                        # 方向一致性: AS5600 双值抖动 (电机转动时 ±7°物理来回跳) 会
+                        # 让 _jump 方向来回翻转, 若照旧累计 5 次采信, pan 跟随抖动跳,
+                        # daz 翻转 → 云台左右疯狂摇摆 (用户反馈"疯狂左右摇摆")。
+                        # 仅连续同向跳变 (真实运动) 才累计采信; 方向翻转视为抖动不采信。
+                        _cur_dir = 1 if _jump > 0 else -1
+                        if self._clamp_dir is None:
+                            self._clamp_dir = _cur_dir
+                        if self._clamp_dir == _cur_dir:
+                            self._clamp_cnt += 1
+                            if self._clamp_cnt >= 5:
+                                # 连续同向钳制 >0.5s: 真实持续运动(包稀疏)被持续误判,
+                                # 采信真实值打破锁死, 解除 daz 冻结, 让 move 正常收敛停止
+                                self._prev_track_pan = pan
+                                self._clamp_cnt = 0
+                                self._clamp_dir = None
+                            else:
+                                pan = self._prev_track_pan
+                        else:
+                            # 方向翻转 = 抖动/振荡: 保持旧基准, 重置计数待方向稳定
+                            self._clamp_cnt = 0
+                            self._clamp_dir = _cur_dir
+                            pan = self._prev_track_pan
+                    else:
+                        self._clamp_cnt = 0
+                        self._clamp_dir = None
+                        self._prev_track_pan = pan
+                elif enc_ok:
+                    self._clamp_cnt = 0
+                    self._prev_track_pan = pan
+                self._prev_track_pan_t = time.time() if enc_ok else self._prev_track_pan_t
+                self._prev_track_enc_ok = enc_ok
                 if not enc_ok:
                     # 编码器失联: 开环惯性推算 (卫星角速度, 不依赖 PTZ 速度)
                     _max_dr = 3.0   # 开环最长 3s, 超时停转防盲转
@@ -1215,6 +1433,7 @@ class SatelliteTracker:
                         if self._pan_moving:
                             self._pan_moving = False
                             self.send_dir("stop")
+                            self._pan_stop_ts = time.time()   # 开环停止同样进入冷却期
                         stop_ev.wait(0.1)
                         continue
                 else:
@@ -1243,10 +1462,20 @@ class SatelliteTracker:
 
                 if not _dr_active:
                     # ---- 水平: 死区 + 持续移动 + 预测停 (AS5600 闭环, 恒速 7.5°/s) ----
+                    # 滞回: 编码器读数 ~±1° 跳变噪声, 卫星尾段方位近乎静止时 daz 由噪声
+                    # 驱动反复越过死区 → 云台持续启停左右摇摆。静止时需误差 >start_lead
+                    # 才启动, 移动中误差 <stop_lead 即停, 消除噪声启停 (启停间隔变大,
+                    # 尾段改为低频小步修正而非高频摇摆)
                     adaz = abs(daz)
                     if self._pan_moving and adaz <= stop_lead:
                         pan_mode = "stop"
                     elif adaz <= deadzone:
+                        pan_mode = "stop"
+                    elif not self._pan_moving and adaz < start_lead:
+                        pan_mode = "stop"
+                    elif not self._pan_moving and time.time() - self._pan_stop_ts < pan_stop_cooldown:
+                        # 停止冷却: 云台刚发过 stop, 还在滑行/编码器读数未稳定,
+                        # 此刻重启 move 会撞上滑行中的实际位移 → 越过后再越回
                         pan_mode = "stop"
                     else:
                         pan_mode = "move"
@@ -1278,6 +1507,9 @@ class SatelliteTracker:
                         self.send_dir("stop")
                         continue
                     else:
+                        if self._pan_moving:
+                            self._pan_stop_ts = time.time()   # 仅 move→stop 转变时启动冷却;
+                            # 若每次 stop 分支都刷新, 冷却永不过期 → pan 永远不重启 (入镜后不动)
                         self._pan_moving = False
                         self.send_dir("stop")
                 else:
