@@ -6,19 +6,28 @@
 # ============================================================
 set -euo pipefail
 
-# ---------- 服务器配置 (通过环境变量注入, 勿硬编码密码) ----------
-# 用法: PTZ_HOST=192.168.31.67 PTZ_USER=aap PTZ_PASS=xxx bash deploy.sh
-HOST="${PTZ_HOST:-192.168.31.67}"
-USER="${PTZ_USER:-aap}"
+# ---------- 服务器配置 (全部通过环境变量注入, 脚本内不硬编码任何个人信息) ----------
+# 用法:
+#   PTZ_HOST=<服务器IP> PTZ_USER=<SSH用户> PTZ_PASS=<密码> \
+#   PTZ_REMOTE_DIR=/home/<用户>/ptz PTZ_WEB_PORT=8090 PTZ_UDP_PORT=8091 \
+#   PTZ_PUBLIC_URL=https://<外网域名> bash deploy.sh
+HOST="${PTZ_HOST:-}"
+USER="${PTZ_USER:-}"
 PASS="${PTZ_PASS:-}"
-REMOTE_DIR="/home/aap/ptz"
-SERVICE="ptz"
+REMOTE_DIR="${PTZ_REMOTE_DIR:-}"
+SERVICE="${PTZ_SERVICE:-ptz}"
+WEB_PORT="${PTZ_WEB_PORT:-8090}"
+UDP_PORT="${PTZ_UDP_PORT:-8091}"
+PUBLIC_URL="${PTZ_PUBLIC_URL:-}"
 
-# 未提供密码则提示
-if [ -z "$PASS" ]; then
-    read -rsp "请输入服务器 SSH 密码: " PASS
-    echo
-fi
+# 缺失必填项则提示输入 (IP/用户/远程路径不能有默认值, 避免误部署到他人服务器)
+if [ -z "$HOST" ]; then read -rp "请输入服务器 IP: " HOST; fi
+if [ -z "$USER" ]; then read -rp "请输入 SSH 用户名: " USER; fi
+if [ -z "$REMOTE_DIR" ]; then read -rp "请输入远程代码目录 (如 /home/xxx/ptz): " REMOTE_DIR; fi
+if [ -z "$PASS" ]; then read -rsp "请输入服务器 SSH 密码: " PASS; echo; fi
+
+# 校验必填项
+[ -n "$HOST" ] && [ -n "$USER" ] && [ -n "$REMOTE_DIR" ] || fail "缺少服务器配置 (IP/用户/远程目录)"
 
 # ---------- 本地项目路径 ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,20 +94,20 @@ else
 fi
 
 # 验证 HTTP 接口
-HTTP_CODE=$($SSH "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/api/auth/me" 2>/dev/null || echo "000")
+HTTP_CODE=$($SSH "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$WEB_PORT/api/auth/me" 2>/dev/null || echo "000")
 info "HTTP 接口 /api/auth/me 返回: $HTTP_CODE (401=正常, 需登录)"
 
 # 验证 UDP 编码器监听
-UDP_OK=$($SSH "ss -ulnp | grep -q 8091 && echo yes || echo no" 2>/dev/null || echo "no")
+UDP_OK=$($SSH "ss -ulnp | grep -q $UDP_PORT && echo yes || echo no" 2>/dev/null || echo "no")
 if [ "$UDP_OK" = "yes" ]; then
-    info "UDP 编码器监听 8091: 正常 ✓"
+    info "UDP 编码器监听 $UDP_PORT: 正常 ✓"
 else
-    warn "UDP 编码器监听 8091: 未检测到"
+    warn "UDP 编码器监听 $UDP_PORT: 未检测到"
 fi
 
 info "部署完成!"
 echo "--------------------------------------------------"
-echo "  本地访问:  http://$HOST:8090"
-echo "  外网访问:  https://ptz.bh6aap.top"
+echo "  本地访问:  http://$HOST:$WEB_PORT"
+if [ -n "$PUBLIC_URL" ]; then echo "  外网访问:  $PUBLIC_URL"; fi
 echo "  查看日志:  ssh $USER@$HOST 'journalctl -u $SERVICE -f'"
 echo "--------------------------------------------------"
