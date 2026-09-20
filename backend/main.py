@@ -30,6 +30,7 @@ import satellite
 import streaming
 import auth
 import rotctld_server
+import lotw
 
 # ---------- 配置 ----------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,6 +53,10 @@ DEFAULT_CONFIG = {
     "tilt_min": 0.0,            # 俯仰最小角度
     "tilt_max": 90.0,           # 俯仰最大角度
     "reset_tilt_s": 15.0,       # 复位俯仰移动时长(秒)
+    "show_maidenhead_grid": False,   # 地图显示梅登海德网格
+    "lotw_callsign": "",             # LoTW 登录呼号
+    "lotw_password": "",             # LoTW 登录密码
+    "vucc_bands": ["6m", "2m", "70cm", "sat"],  # VUCC 网格显示频段过滤
 }
 
 _config_lock = threading.Lock()
@@ -93,8 +98,14 @@ def update_config(data: dict) -> dict:
     with _config_lock:
         for k in DEFAULT_CONFIG:
             if k in data and data[k] is not None:
-                if isinstance(DEFAULT_CONFIG[k], bool):
+                dv = DEFAULT_CONFIG[k]
+                if isinstance(dv, bool):
                     config[k] = bool(data[k])
+                elif isinstance(dv, str):
+                    config[k] = str(data[k]).strip()
+                elif isinstance(dv, list):
+                    v = data[k]
+                    config[k] = [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else []
                 else:
                     try:
                         config[k] = float(data[k])
@@ -1203,6 +1214,27 @@ def post_settings():
     data = request.get_json(silent=True) or {}
     cfg = update_config(data)
     return ok(cfg)
+
+
+# ---------- LoTW / VUCC ----------
+@app.route("/api/lotw/fetch", methods=["POST"])
+def lotw_fetch():
+    """触发 LoTW 日志拉取 (后台线程, 前端轮询 /api/lotw 状态)"""
+    data = request.get_json(silent=True) or {}
+    callsign = str(data.get("callsign") or get_cfg("lotw_callsign") or "").strip()
+    password = str(data.get("password") or get_cfg("lotw_password") or "")
+    if not callsign or not password:
+        return err("请先在设置中填写 LoTW 呼号与密码")
+    if get_cfg("lotw_callsign") != callsign or get_cfg("lotw_password") != password:
+        update_config({"lotw_callsign": callsign, "lotw_password": password})
+    lotw.start_fetch(callsign, password)
+    return ok({"state": lotw.get_status()["state"]})
+
+
+@app.route("/api/lotw")
+def lotw_status():
+    """LoTW 拉取状态 + 缓存 VUCC 数据 (bands 按频段: 已确认网格列表)"""
+    return ok({"status": lotw.get_status(), **lotw.get_vucc()})
 
 
 # ---------- 暂停控制 ----------

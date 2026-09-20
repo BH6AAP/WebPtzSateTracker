@@ -102,6 +102,137 @@
   }
   window.updateObserverOnMap = updateObserverOnMap;
 
+  // ===== 梅登海德网格 (场级线) + 4 字符文字 + VUCC 已确认网格叠加层 =====
+  let gridLineLayer = null;    // 场级网格线 (20°×10°, 2 字符 AA-RR)
+  let gridLabelLayer = null;   // 4 字符网格文字标注
+  let vuccLayer = null;        // VUCC 已确认网格方块
+  const MIN_GRID_ZOOM = 5;     // 低于该缩放级别不显示网格 (低级别下网格过密)
+  const VUCC_COLORS = { '6m': '#22c55e', '2m': '#3b82f6', '70cm': '#f59e0b', 'sat': '#a78bfa' };
+  const VUCC_ORDER = ['6m', '2m', '70cm', 'sat'];
+
+  // 梅登海德 4 字符网格 (2°×1°) 顶点坐标
+  function gridCellCorners(grid) {
+    const g = grid.toUpperCase();
+    const lon = -180 + (g.charCodeAt(0) - 65) * 20 + Number(g[2]) * 2;
+    const lat = -90 + (g.charCodeAt(1) - 65) * 10 + Number(g[3]);
+    return [[lat, lon], [lat, lon + 2], [lat + 1, lon + 2], [lat + 1, lon]];
+  }
+
+  // 网格线: 场级 (20°×10°) 浅黄 + 4 字符级 (2°×1°) 浅灰细线
+  function buildGridLines() {
+    if (gridLineLayer) { map.removeLayer(gridLineLayer); gridLineLayer = null; }
+    if (map.getZoom() < MIN_GRID_ZOOM) return;
+    const lines = [];
+    for (let lon = -180; lon <= 180; lon += 20) {
+      lines.push([[90, lon], [-90, lon]]);
+    }
+    for (let lat = -90; lat <= 90; lat += 10) {
+      lines.push([[lat, -180], [lat, 180]]);
+    }
+    gridLineLayer = L.layerGroup(
+      lines.map(pts => L.polyline(pts, { color: '#fbbf24', weight: 0.8, opacity: 0.3, interactive: false }))
+    ).addTo(map);
+    // 4 字符级网格线 (2°×1°), 浅灰细线
+    const fine = [];
+    for (let lon = -180; lon <= 180; lon += 2) {
+      fine.push([[90, lon], [-90, lon]]);
+    }
+    for (let lat = -90; lat <= 90; lat += 1) {
+      fine.push([[lat, -180], [lat, 180]]);
+    }
+    gridLineLayer.addLayer(L.layerGroup(
+      fine.map(pts => L.polyline(pts, { color: '#9ca3af', weight: 0.5, opacity: 0.3, interactive: false }))
+    ));
+  }
+
+  // 4 字符网格文字标注 (字号随缩放级别变化, 保持相对网格的固定比例)
+  function buildGridLabels() {
+    if (gridLabelLayer) { map.removeLayer(gridLabelLayer); gridLabelLayer = null; }
+    if (map.getZoom() < MIN_GRID_ZOOM) return;
+    const z = map.getZoom();
+    // 2° 经度在当前 zoom 下的像素宽 (Web Mercator: 256*2^z px = 360°)
+    const gridW = 256 * Math.pow(2, z) * (2 / 360);
+    // 4 字符等宽文字宽 ≈ 2.4×字号, 让文字宽占网格宽的 ~30%
+    const fs = Math.max(12, Math.round(gridW * 0.125));
+    const b = map.getBounds();
+    const lon0 = Math.max(-180, Math.floor(b.getWest() / 2) * 2);
+    const lon1 = Math.min(180, Math.ceil(b.getEast() / 2) * 2);
+    const lat0 = Math.max(-90, Math.floor(b.getSouth()));
+    const lat1 = Math.min(90, Math.ceil(b.getNorth()));
+    const labels = [];
+    for (let lon = lon0; lon < lon1; lon += 2) {
+      for (let lat = lat0; lat < lat1; lat += 1) {
+        const ch1 = String.fromCharCode(65 + Math.floor((lon + 180) / 20));
+        const ch2 = String.fromCharCode(65 + Math.floor((lat + 90) / 10));
+        const d1 = Math.floor(((lon + 180) % 20) / 2);
+        const d2 = Math.floor((lat + 90) % 10);
+        const grid = `${ch1}${ch2}${d1}${d2}`;
+        labels.push(L.marker([lat + 0.5, lon + 1], {
+          icon: L.divIcon({
+            className: 'grid-label',
+            html: `<span style="font-size:${fs}px;line-height:${Math.round(fs * 1.2)}px;">${grid}</span>`,
+            iconSize: [Math.round(fs * 2.6), Math.round(fs * 1.3)],
+            iconAnchor: [Math.round(fs * 1.3), Math.round(fs * 0.65)]
+          }),
+          interactive: false, keyboard: false
+        }));
+      }
+    }
+    if (labels.length) gridLabelLayer = L.layerGroup(labels).addTo(map);
+  }
+
+  // 视口变化时按缩放级别显示/隐藏网格 (避免海量 marker 常驻拖垮地图)
+  function bindGridLabelRefresh() {
+    map.on('moveend zoomend', () => {
+      if (!window.__gridEnabled) return;
+      if (map.getZoom() < MIN_GRID_ZOOM) {
+        if (gridLineLayer) { map.removeLayer(gridLineLayer); gridLineLayer = null; }
+        if (gridLabelLayer) { map.removeLayer(gridLabelLayer); gridLabelLayer = null; }
+        return;
+      }
+      buildGridLines();
+      buildGridLabels();
+    });
+  }
+
+  // VUCC 已确认网格方块 (按设置中勾选的频段过滤)
+  function buildVuccLayer() {
+    if (vuccLayer) { map.removeLayer(vuccLayer); vuccLayer = null; }
+    const checked = new Set(Array.from(document.querySelectorAll('.vucc-band:checked')).map(cb => cb.value));
+    if (!checked.size) return;
+    fetch('/api/lotw').then(r => r.json()).then(d => {
+      if (!d.ok || !d.bands) return;
+      const rects = [];
+      for (const band of VUCC_ORDER) {
+        if (!checked.has(band)) continue;
+        const color = VUCC_COLORS[band] || '#22c55e';
+        (d.bands[band] || []).forEach(g => {
+          rects.push(L.polygon(gridCellCorners(g), {
+            color: color, weight: 1, fillColor: color, fillOpacity: 0.45, interactive: false
+          }));
+        });
+      }
+      if (rects.length) vuccLayer = L.layerGroup(rects).addTo(map);
+    }).catch(() => { /* 忽略 */ });
+  }
+
+  // 设置变化后刷新叠加层 (由设置面板保存后调用)
+  async function applyGridSettings() {
+    try {
+      const r = await fetch('/api/settings');
+      const d = await r.json();
+      const show = d.ok && !!d.show_maidenhead_grid;
+      window.__gridEnabled = show;
+      if (show) { buildGridLines(); buildGridLabels(); }
+      else {
+        if (gridLineLayer) { map.removeLayer(gridLineLayer); gridLineLayer = null; }
+        if (gridLabelLayer) { map.removeLayer(gridLabelLayer); gridLabelLayer = null; }
+      }
+    } catch (e) { /* 忽略 */ }
+    buildVuccLayer();
+  }
+  window.applyGridSettings = applyGridSettings;
+
   // ===== 倒计时格式化 =====
   function formatCountdown(sec) {
     sec = Math.floor(sec);
@@ -974,9 +1105,11 @@
 
   // ===== 初始化 =====
   initMap();
+  bindGridLabelRefresh();
   bindTrackDurBtns();
   loadEncCal();
   openStream();
+  setTimeout(applyGridSettings, 1500);   // 页面加载后按设置绘制网格/VUCC 层
   // 先确认后端跟踪状态 (决定恢复哪颗卫星), 再渲染收藏列表并恢复选中
   (async () => {
     await restoreTracking();

@@ -46,6 +46,7 @@ $SSH "echo ok" >/dev/null 2>&1 || fail "无法连接服务器, 请检查网络/I
 info "同步后端代码 -> $REMOTE_DIR/backend/"
 $SCP "$BACKEND_DIR/main.py" "$BACKEND_DIR/auth.py" "$BACKEND_DIR/satellite.py" "$BACKEND_DIR/streaming.py" \
      "$BACKEND_DIR/pelco.py" "$BACKEND_DIR/rotctld_server.py" "$BACKEND_DIR/ws_server.py" "$BACKEND_DIR/requirements.txt" \
+     "$BACKEND_DIR/lotw.py" \
      "$USER@$HOST:$REMOTE_DIR/backend/"
 
 # ---------- 3. 同步前端静态文件 ----------
