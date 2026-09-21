@@ -1342,15 +1342,25 @@ def _stream_photocalib():
                 "result": _photo_calib.get("result")}
 
 
+def _stream_enc():
+    """编码器角度帧 (高频, 只推大数字角度字段, 小帧不拖慢弱链路)"""
+    with _encoder_lock:
+        st = dict(_encoder_state)
+    with tracker.lock:
+        st["tilt"] = tracker.tilt
+    return {"dpan": st.get("dpan"), "pan": st.get("pan"), "tilt": st.get("tilt")}
+
+
 @app.route("/api/stream")
 def stream():
-    """SSE 推流: state(1s) / serial(0.8s) / favorites(30s) / photocalib(1s)
+    """SSE 推流: state(1s) / enc(0.1s) / serial(0.8s) / favorites(30s) / photocalib(1s)
     目标位置由 query 参数指定: norad=<编号> 或 celestial=moon|sun
     """
     norad = request.args.get("norad") or None
     celestial = request.args.get("celestial") or None
     return streaming.make_stream_response({
         "state": (lambda: _stream_state(norad, celestial), streaming.STATE_INTERVAL),
+        "enc": (_stream_enc, streaming.ENC_INTERVAL),
         "serial": (_stream_serial, streaming.SERIAL_INTERVAL),
         "favorites": (_stream_favorites, streaming.FAVORITES_INTERVAL),
         "photocalib": (_stream_photocalib, streaming.PHOTOCALIB_INTERVAL),
@@ -2641,6 +2651,7 @@ if __name__ == "__main__":
         return [
             (streaming.STATE_INTERVAL, "state",
              lambda n=norad, c=celestial: _stream_state(n, c)),
+            (streaming.ENC_INTERVAL, "enc", _stream_enc),
             (streaming.SERIAL_INTERVAL, "serial", _stream_serial),
             (streaming.FAVORITES_INTERVAL, "favorites", _stream_favorites),
             (streaming.PHOTOCALIB_INTERVAL, "photocalib", _stream_photocalib),

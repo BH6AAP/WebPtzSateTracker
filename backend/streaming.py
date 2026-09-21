@@ -10,6 +10,7 @@ import time
 from flask import Response
 
 STATE_INTERVAL = 0.4      # 状态帧 (串口状态/云台位置/目标位置/编码器角度) — 角度也走 SSE, 外网/内网统一实时
+ENC_INTERVAL = 0.1        # 编码器角度帧 (高频: 大数字角度实时跟随, 不随低频状态帧阶梯跳变)
 SERIAL_INTERVAL = 2.5      # 串口日志帧 (200 条完整列表较大, 降频避免慢链路下大帧阻塞状态帧到达)
 FAVORITES_INTERVAL = 30.0  # 收藏列表帧
 PHOTOCALIB_INTERVAL = 1.0  # 光电标定状态帧

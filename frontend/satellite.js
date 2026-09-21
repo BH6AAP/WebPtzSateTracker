@@ -1109,6 +1109,9 @@
         }
       } else if (name === 'serial') {
         if (window.renderSerialLog) window.renderSerialLog(d);
+      } else if (name === 'enc') {
+        // 高频角度帧 (0.1s): 只刷新大数字角度, 避免方向线/编码器面板重复渲染开销
+        if (d) applyEncFrame(d);
       } else if ( name === 'favorites') {
         renderFavorites(d);
       } else if (name === 'photocalib') {
@@ -1124,6 +1127,7 @@
     else if (target && target.celestial) url += '?celestial=' + target.celestial;
     streamEs = new EventSource(url);
     streamEs.addEventListener('state', e => onStreamFrame('state', JSON.parse(e.data)));
+    streamEs.addEventListener('enc', e => onStreamFrame('enc', JSON.parse(e.data)));
     streamEs.addEventListener('serial', e => onStreamFrame('serial', JSON.parse(e.data)));
     streamEs.addEventListener('favorites', e => onStreamFrame('favorites', JSON.parse(e.data)));
     streamEs.addEventListener('photocalib', e => onStreamFrame('photocalib', JSON.parse(e.data)));
