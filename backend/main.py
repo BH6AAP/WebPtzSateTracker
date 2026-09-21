@@ -602,7 +602,6 @@ FIND_ZERO_TIMEOUT = 240.0
 
 # 超限回转参数: 堵转检测 (驱动一段时间回传角度无变化 => 线缆缠死/堵转)
 RECOVER_SPEED = 0x10          # 回转中速 (物理 ~3.8°/s)
-RECOVER_PROBE_S = 0.6         # 方向试探驱动时长 (秒)
 RECOVER_STALL_S = 2.5         # 连续驱动多少秒回传角无实质变化判定堵转
 RECOVER_STALL_TOL = 2.0       # 物理角: 该时长内角度变化小于此值视为堵转
 RECOVER_DEADLINE_S = 240.0    # 回转总超时 (物理 ±540°@3.8°/s 约 284s, 取此值兜底)
@@ -623,37 +622,21 @@ def _get_enc_offset():
 
 
 def _probe_recover_direction():
-    """反馈试探回转方向: 向 left 驱动 RECOVER_PROBE_S, 比较偏移是否向 0 收敛。
-    该云台 left/right 实际转向可能与标准帧相反, 不硬编码方向, 以回传角度为准。
-    返回: 'left'/'right'/'stop' (无有效反馈时 stop, 不做试探)
+    """按回传角度与基准零位的符号差直接判定回转方向, 不试探。
+    方向映射 (硬件固定): right=顺时针=angle 增大, left=逆时针=angle 减小
+    (见跟踪中经过光电: dir=="right" 才锚定, L2377)。
+    off = angle - zero_angle:
+      off > 0 → 当前在基准顺时针侧, 需 angle 减小 → left
+      off < 0 → 当前在基准逆时针侧, 需 angle 增大 → right
+    返回: 'left'/'right'/'stop' (无编码器数据或未标定时 stop)
     """
-    off0 = _get_enc_offset()
-    if off0 is None:
-        print("[reset/probe] 无初始偏移, 放弃试探", flush=True)
+    off = _get_enc_offset()
+    if off is None:
+        print("[reset/probe] 无偏移数据, 无法判定方向", flush=True)
         return "stop"
-    try:
-        send(_MOVE_CMDS["left"](RECOVER_SPEED))
-        time.sleep(RECOVER_PROBE_S)
-        _stop_send()
-    except Exception as e:  # noqa: BLE001
-        _stop_send()
-        print(f"[reset/probe] 串口发送失败: {e}", flush=True)
-        return "stop"
-    # 停止后等编码器刷新: 弱链路(电力猫 170ms+)回传延迟大, 只读一次可能读到旧值
-    # → dOff=0 → 默认 right 误判 (曾现: off=107 被错判 right, 越转越远到 256)
-    off1 = off0
-    _probe_deadline = time.time() + RECOVER_PROBE_S
-    while time.time() < _probe_deadline:
-        cur = _get_enc_offset()
-        if cur is not None:
-            off1 = cur
-        if abs(off1 - off0) >= 2.0:   # 反馈已更新 (≥2 ESP = 0.5°物理)
-            break
-        time.sleep(0.05)
-    print(f"[reset/probe] off0={off0:.0f} off1={off1:.0f} dOff={off1-off0:.0f}°ESP", flush=True)
-    if abs(off1) < abs(off0):
-        return "left"          # left 使偏移收敛
-    return "right"             # left 使偏移发散/无反馈 -> 用 right
+    direction = "left" if off > 0 else "right"
+    print(f"[reset/probe] off={off:.0f}°ESP -> 方向 {direction}", flush=True)
+    return direction
 
 
 def _recover_from_tangle():
